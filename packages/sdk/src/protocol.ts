@@ -1,5 +1,6 @@
 import type {
   AppContext,
+  CallState,
   Card,
   ChatTarget,
   FileChange,
@@ -15,6 +16,7 @@ import type {
   Span,
   Theme,
   UploadOptions,
+  VoiceChannel,
 } from "./types.js";
 
 /** Bumped when a frame or a call changes in a way an older app can't follow. */
@@ -78,6 +80,9 @@ export interface Methods {
   "route.navigate": [{ route: Route; replace?: boolean }, void];
   "room.update": [{ id: string; update: Uint8Array }, void];
   "room.awareness": [{ id: string; update: Uint8Array }, void];
+  "calls.join": [{ channel_id: string }, void];
+  "calls.leave": [void, void];
+  "calls.mute": [{ muted: boolean }, void];
 }
 
 export type RoomEvent = { type: "sync"; update: Uint8Array } | { type: "awareness"; update: Uint8Array };
@@ -89,6 +94,8 @@ export interface Topics {
   "members.presence": [void, Presence[]];
   "files.watch": [{ folder?: string; accept?: string[] } | void, FileChange];
   room: [{ id: string; gc?: boolean }, RoomEvent];
+  "calls.channels": [void, VoiceChannel[]];
+  "calls.current": [void, CallState];
 }
 
 export type MethodName = keyof Methods;

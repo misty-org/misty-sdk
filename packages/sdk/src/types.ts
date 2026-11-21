@@ -118,7 +118,21 @@ export interface UploadOptions {
 }
 
 /** What an app can ask for in `misty-app.json`. The mod approves these once, at install. */
-export type Permission = "files" | "chat.post" | "rooms" | "members";
+export type Permission = "files" | "chat.post" | "rooms" | "members" | "calls";
+
+/** One of the Space's voice channels, and who is in it now. */
+export interface VoiceChannel {
+  channel_id: string;
+  name: string;
+  /** The user ids of the people in it, each once. */
+  people: string[];
+}
+
+/** This window's call: the voice channel it is in (null when none) and whether its microphone is on. */
+export interface CallState {
+  channel_id: string | null;
+  mic_on: boolean;
+}
 
 export type McpKind = "frame" | "binary";
 

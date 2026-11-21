@@ -10,6 +10,7 @@ import type { Room, RoomOptions } from "./room.js";
 import { applyTheme } from "./theme.js";
 import type {
   AppContext,
+  CallState,
   Card,
   ChatTarget,
   FileChange,
@@ -27,6 +28,7 @@ import type {
   Space,
   Theme,
   UploadOptions,
+  VoiceChannel,
 } from "./types.js";
 
 export const SDK_VERSION = "0.1.0";
@@ -77,6 +79,22 @@ export interface Misty {
 
   /** A live Yjs document on the Space's collaboration rooms. Call `destroy()` when done. */
   room(id: string, options?: RoomOptions): Room;
+
+  /**
+   * The Space's voice channels and this window's call, for showing them in the app's own interface. The
+   * call itself runs in Misty's window, end-to-end encrypted; the app never touches its sound or video.
+   * Needs the `calls` permission.
+   */
+  calls: {
+    /** Calls back with the voice channels and who is in each, now and on every change. */
+    channels(listener: (channels: VoiceChannel[]) => void): Unsubscribe;
+    /** Calls back with this window's call (its channel, its microphone), now and on every change. */
+    current(listener: (call: CallState) => void): Unsubscribe;
+    /** Drops into a voice channel, out of the one this window is in first. */
+    join(channelId: string): Promise<void>;
+    leave(): Promise<void>;
+    setMuted(muted: boolean): Promise<void>;
+  };
 
   /** The app's MCP stream, for `mcp: frame` apps; hand it to the official MCP library. */
   mcpTransport(): FrameTransport;
@@ -151,6 +169,13 @@ function buildMisty(connection: Connection, context: AppContext, options: Create
       download: (fileId) => connection.call("files.download", { file_id: fileId }),
     },
     room: (id, roomOptions) => openRoom(connection, id, roomOptions),
+    calls: {
+      channels: (listener) => connection.subscribe("calls.channels", undefined, listener),
+      current: (listener) => connection.subscribe("calls.current", undefined, listener),
+      join: (channelId) => connection.call("calls.join", { channel_id: channelId }),
+      leave: () => connection.call("calls.leave"),
+      setMuted: (muted) => connection.call("calls.mute", { muted }),
+    },
     mcpTransport: () => createFrameTransport(connection),
     onClose: (listener) => connection.onClose(listener),
     close: () => connection.close(),

@@ -1,4 +1,5 @@
 import type {
+  CallState,
   FileRef,
   ListFilesOptions,
   Me,
@@ -9,6 +10,7 @@ import type {
   Route,
   Space,
   Theme,
+  VoiceChannel,
 } from "@misty/sdk";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useMisty } from "./context.js";
@@ -42,6 +44,19 @@ export function useMembers(): Loaded<Member[]> & { reload: () => void } {
 export function usePresence(): Loaded<Presence[]> {
   const misty = useMisty();
   return useLive("presence", (listener) => misty.members.presence(listener));
+}
+
+/** The Space's voice channels and who is in each, live. Needs the `calls` permission. */
+export function useVoiceChannels(): Loaded<VoiceChannel[]> {
+  const misty = useMisty();
+  return useLive<VoiceChannel[]>("calls.channels", (listener) => misty.calls.channels(listener));
+}
+
+/** This window's call (its voice channel and microphone), live, with join, leave and mute. */
+export function useCall(): Loaded<CallState> & Pick<ReturnType<typeof useMisty>["calls"], "join" | "leave" | "setMuted"> {
+  const misty = useMisty();
+  const state = useLive<CallState>("calls.current", (listener) => misty.calls.current(listener));
+  return { ...state, join: misty.calls.join, leave: misty.calls.leave, setMuted: misty.calls.setMuted };
 }
 
 /** The Space's files in a folder, refreshed when any of them is added, changed or removed. */

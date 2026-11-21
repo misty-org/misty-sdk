@@ -6,6 +6,8 @@ export {
   useMe,
   useMembers,
   usePresence,
+  useVoiceChannels,
+  useCall,
   useRoom,
   useRoute,
   useSpace,

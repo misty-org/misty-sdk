@@ -41,3 +41,8 @@ room.destroy(); // leave, and free the document
 Pass `{ gc: false }` to keep deleted content in the document (on the app's side and Misty's), for an app that
 undoes its own history or shows who deleted what. In React, `useRoom(id, options)` gives the room, whether it has
 synced, and why it couldn't open or stopped.
+
+## Docs
+
+The guides are in [`docs/`](docs): getting started, files and chat, live rooms, React and agent tools. They are
+plain Markdown with a title and order in their front matter, so the Misty docs site pulls them in as they are.
