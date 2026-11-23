@@ -3,12 +3,15 @@ import type { Channel, Unsubscribe } from "./connection.js";
 import { MistyError } from "./errors.js";
 import { createFrameTransport } from "./mcp.js";
 import type { FrameTransport } from "./mcp.js";
-import { INIT_MESSAGE, PROTOCOL_VERSION } from "./protocol.js";
-import type { InitMessage } from "./protocol.js";
-import { openRoom } from "./room.js";
-import type { Room, RoomOptions } from "./room.js";
+import { live } from "./live.js";
+import type { Live } from "./live.js";
+import { FIRST_OFFERS, INIT_MESSAGE, PROTOCOL_VERSIONS } from "./protocol.js";
+import type { HelloResult, InitMessage, Offers, Topics, WatchOptions } from "./protocol.js";
+import { openFileRoom, openRoom } from "./room.js";
+import type { FileRoom, FileRoomOptions, Room, RoomHost, RoomOptions } from "./room.js";
 import { applyTheme } from "./theme.js";
 import type {
+  AgentControl,
   AppContext,
   CallState,
   Card,
@@ -31,13 +34,33 @@ import type {
   VoiceChannel,
 } from "./types.js";
 
-export const SDK_VERSION = "0.1.0";
+export const SDK_VERSION = "0.2.0";
 
-/** Everything a Space gives an app. Each call is checked by Misty against what the mod approved. */
+type LiveTopic = "members.presence" | "calls.channels" | "calls.current" | "agents.control";
+
+export interface RoomOpener {
+  (id: string, options?: RoomOptions): Room;
+  forFile(fileId: string, options?: FileRoomOptions): FileRoom;
+}
+
+export interface LiveFilesOptions {
+  folder?: string;
+  accept?: string[];
+}
+
+export interface MistyLive {
+  presence(): Live<Presence[]>;
+  voiceChannels(): Live<VoiceChannel[]>;
+  call(): Live<CallState>;
+  files(options?: LiveFilesOptions): Live<FileRef[]>;
+  agent(): Live<AgentControl>;
+}
+
 export interface Misty {
   readonly appId: string;
-  /** What the mod approved at install; a call outside it answers `permission_denied`. */
   readonly permissions: AppContext["permissions"];
+  readonly protocol: number;
+  supports(name: string): boolean;
   space(): Space;
   me(): Me;
   theme(): Theme;
@@ -48,14 +71,11 @@ export interface Misty {
 
   members: {
     list(): Promise<Member[]>;
-    /** Calls back with everyone's presence now and on every change. */
     presence(listener: (presence: Presence[]) => void): Unsubscribe;
-    /** Who and what a mention picker offers for what was typed. */
     mentionables(query: string): Promise<Mentionable[]>;
   };
 
   chat: {
-    /** Posts an APP message with an Open card to a channel or DM. */
     post(target: ChatTarget, spans: Span[], card?: Card): Promise<{ message_id: string }>;
     openChat(target: ChatTarget): Promise<void>;
     notify(userId: string, text: string, route?: Route): Promise<void>;
@@ -63,13 +83,7 @@ export interface Misty {
 
   files: {
     pick(options?: PickOptions): Promise<FileRef[]>;
-    /** Opens a Space file in the app that handles it (this one, or another installed one). */
     open(fileId: string, appId?: string): Promise<void>;
-    /**
-     * Saves into the Space's drive, in the app's own folder (`/<App name>/`) unless `folder` says
-     * otherwise. Saving a file the app opened replaces it; if someone changed it meanwhile, a text
-     * file merges both, and anything else keeps the last save, with the one it replaced in the trash.
-     */
     save(options: SaveOptions): Promise<FileRef>;
     list(options?: ListFilesOptions): Promise<FilePage>;
     watch(listener: (change: FileChange) => void, options?: { folder?: string; accept?: string[] }): Unsubscribe;
@@ -77,44 +91,46 @@ export interface Misty {
     download(fileId: string): Promise<{ file: FileRef; data: ArrayBuffer }>;
   };
 
-  /** A live Yjs document on the Space's collaboration rooms. Call `destroy()` when done. */
-  room(id: string, options?: RoomOptions): Room;
+  room: RoomOpener;
 
-  /**
-   * The Space's voice channels and this window's call, for showing them in the app's own interface. The
-   * call itself runs in Misty's window, end-to-end encrypted; the app never touches its sound or video.
-   * Needs the `calls` permission.
-   */
+  agents: {
+    control(listener: (control: AgentControl) => void): Unsubscribe;
+  };
+
+  live: MistyLive;
+
   calls: {
-    /** Calls back with the voice channels and who is in each, now and on every change. */
     channels(listener: (channels: VoiceChannel[]) => void): Unsubscribe;
-    /** Calls back with this window's call (its channel, its microphone), now and on every change. */
     current(listener: (call: CallState) => void): Unsubscribe;
-    /** Drops into a voice channel, out of the one this window is in first. */
     join(channelId: string): Promise<void>;
     leave(): Promise<void>;
     setMuted(muted: boolean): Promise<void>;
   };
 
-  /** The app's MCP stream, for `mcp: frame` apps; hand it to the official MCP library. */
   mcpTransport(): FrameTransport;
 
-  /** Fires once when the host closes the channel (the tab closed or Misty is quitting). */
   onClose(listener: () => void): Unsubscribe;
   close(): void;
 }
 
 export interface CreateMistyOptions {
-  /** Apply the host's theme to the document now and on every change. On by default in a browser. */
   applyTheme?: boolean;
 }
 
-/** Builds the client over an open channel and the context the host sent. Hosts and tests use this directly. */
-export function createMisty(channel: Channel, context: AppContext, options: CreateMistyOptions = {}): Misty {
+export function createMisty(channel: Channel, context: HelloResult, options: CreateMistyOptions = {}): Misty {
   return buildMisty(new Connection(channel), context, options);
 }
 
-function buildMisty(connection: Connection, context: AppContext, options: CreateMistyOptions): Misty {
+const MAX_LISTED_PAGES = 50;
+
+function buildMisty(connection: Connection, context: HelloResult, options: CreateMistyOptions): Misty {
+  const offers: Offers = context.offers ?? FIRST_OFFERS;
+  const offered = new Set([...offers.calls, ...offers.topics]);
+  const supports = (name: string) => offered.has(name);
+  const roomHost: RoomHost = {
+    syncs: offers.calls.includes("room.sync"),
+    me: { user_id: context.me.user_id, name: context.me.name, tone: context.me.tone ?? null },
+  };
   let theme = context.theme;
   let route = context.route;
   const themeListeners = new Set<(theme: Theme) => void>();
@@ -137,9 +153,88 @@ function buildMisty(connection: Connection, context: AppContext, options: Create
     return () => set.delete(listener);
   };
 
+  const topicValue = <T extends LiveTopic>(topic: T): Live<Topics[T][1]> =>
+    live<Topics[T][1]>((set, fail) =>
+      connection.subscribe(topic, undefined as Topics[T][0], set, (error) =>
+        fail(error ?? new MistyError("closed", "Misty stopped sending this.")),
+      ),
+    );
+
+  const shared = new Map<string, Live<unknown>>();
+  const once = <T>(key: string, make: () => Live<T>): Live<T> => {
+    const known = shared.get(key);
+    if (known) return known as Live<T>;
+    const made = make();
+    shared.set(key, made as Live<unknown>);
+    return made;
+  };
+
+  const liveFiles = (filesOptions: LiveFilesOptions = {}) =>
+    live<FileRef[]>((set, fail) => {
+      const files = new Map<string, FileRef>();
+      const early: FileChange[] = [];
+      let listed = false;
+      let closed = false;
+      const publish = () =>
+        set([...files.values()].sort((left, right) => left.name.localeCompare(right.name)));
+      const apply = (change: FileChange) => {
+        if (change.kind === "removed") files.delete(change.id);
+        else files.set(change.file.id, change.file);
+      };
+      const watch: WatchOptions = filesOptions.folder
+        ? { folder: filesOptions.folder, accept: filesOptions.accept }
+        : { accept: filesOptions.accept, default_folder: true };
+      const stop = connection.subscribe(
+        "files.watch",
+        watch,
+        (change) => {
+          if (!listed) {
+            early.push(change);
+            return;
+          }
+          apply(change);
+          publish();
+        },
+        (error) => fail(error ?? new MistyError("closed", "Misty stopped watching these files.")),
+      );
+      void (async () => {
+        let cursor: string | undefined;
+        for (let page = 0; page < MAX_LISTED_PAGES; page += 1) {
+          const result = await connection.call("files.list", {
+            folder: filesOptions.folder,
+            accept: filesOptions.accept,
+            cursor,
+          });
+          for (const found of result.files) files.set(found.id, found);
+          cursor = result.next_cursor;
+          if (!cursor) break;
+        }
+        if (closed) return;
+        listed = true;
+        for (const change of early.splice(0)) apply(change);
+        publish();
+      })().catch((error: unknown) => {
+        if (!closed) fail(error instanceof MistyError ? error : new MistyError("internal", String(error)));
+      });
+      return () => {
+        closed = true;
+        stop();
+      };
+    });
+
+  const room = ((id: string, roomOptions?: RoomOptions) =>
+    openRoom(connection, id, roomOptions ?? {}, roomHost)) as RoomOpener;
+  room.forFile = (fileId, fileOptions) => {
+    if (!supports("room.sync"))
+      throw new MistyError("unsupported", "This version of Misty can't open a file as a live document.");
+    return openFileRoom(connection, fileId, fileOptions ?? {}, roomHost);
+  };
+
   return {
     appId: context.app_id,
     permissions: context.permissions,
+    protocol: context.protocol ?? 1,
+    supports,
     space: () => context.space,
     me: () => context.me,
     theme: () => theme,
@@ -168,7 +263,20 @@ function buildMisty(connection: Connection, context: AppContext, options: Create
       upload: (uploadOptions) => connection.call("files.upload", uploadOptions),
       download: (fileId) => connection.call("files.download", { file_id: fileId }),
     },
-    room: (id, roomOptions) => openRoom(connection, id, roomOptions),
+    room,
+    agents: {
+      control: (listener) => connection.subscribe("agents.control", undefined, listener),
+    },
+    live: {
+      presence: () => once("presence", () => topicValue("members.presence")),
+      voiceChannels: () => once("voice", () => topicValue("calls.channels")),
+      call: () => once("call", () => topicValue("calls.current")),
+      agent: () => once("agent", () => topicValue("agents.control")),
+      files: (filesOptions) =>
+        once(`files:${JSON.stringify([filesOptions?.folder ?? null, filesOptions?.accept ?? null])}`, () =>
+          liveFiles(filesOptions),
+        ),
+    },
     calls: {
       channels: (listener) => connection.subscribe("calls.channels", undefined, listener),
       current: (listener) => connection.subscribe("calls.current", undefined, listener),
@@ -183,29 +291,31 @@ function buildMisty(connection: Connection, context: AppContext, options: Create
 }
 
 export interface ConnectOptions extends CreateMistyOptions {
-  /** How long to wait for the host to start the app before giving up. Default 10 seconds. */
   timeoutMs?: number;
 }
 
-/** The start message as it arrived, kept until `connect()` asks for it. */
 interface StartMessage {
   version: unknown;
+  versions: unknown;
   port: MessagePort;
 }
 
-/** Whether a window message is the host's start message: from the frame's parent (or the page itself) with a port. */
+export function pickProtocol(start: { version: unknown; versions?: unknown }): number | null {
+  const offered = Array.isArray(start.versions) ? start.versions : [start.version];
+  const common = offered.filter(
+    (version): version is number => typeof version === "number" && PROTOCOL_VERSIONS.includes(version),
+  );
+  return common.length ? Math.max(...common) : null;
+}
+
 function startMessageOf(event: MessageEvent): StartMessage | undefined {
-  // The frame's parent starts a sandboxed frame; a webview starts itself.
   if (event.source !== window.parent && event.source !== window) return undefined;
   const data = event.data as Partial<InitMessage> | null;
   const port = event.ports[0];
   if (!data || data.type !== INIT_MESSAGE || !port) return undefined;
-  return { version: data.version, port };
+  return { version: data.version, versions: data.versions, port };
 }
 
-// The host starts the app when its frame has loaded, which can be before the app's own code gets as far as
-// calling `connect()` (a framework mounts a tick later). So the message is caught here, when this module
-// loads, and kept for `connect()`.
 let early: StartMessage | undefined;
 if (typeof window !== "undefined") {
   window.addEventListener("message", (event) => {
@@ -214,11 +324,6 @@ if (typeof window !== "undefined") {
   });
 }
 
-/**
- * Connects an app running inside Misty. Takes the start message the host sent (waiting for it if it hasn't
- * come), takes the channel it hands over and asks for the app's context. Rejects when the page isn't running
- * inside Misty.
- */
 export function connect(options: ConnectOptions = {}): Promise<Misty> {
   const timeoutMs = options.timeoutMs ?? 10_000;
   return new Promise<Misty>((resolve, reject) => {
@@ -227,22 +332,24 @@ export function connect(options: ConnectOptions = {}): Promise<Misty> {
       window.removeEventListener("message", onMessage);
       clearTimeout(waiting.timer);
     };
-    const begin = ({ version, port }: StartMessage) => {
+    const begin = (start: StartMessage) => {
       cleanup();
-      if (version !== PROTOCOL_VERSION) {
+      const { port } = start;
+      const protocol = pickProtocol(start);
+      if (protocol === null) {
         port.close();
         reject(
           new MistyError(
             "unsupported",
-            `This Misty speaks protocol ${String(version)}, but the app's SDK speaks ${PROTOCOL_VERSION}.`,
+            `This Misty speaks protocol ${String(start.versions ?? start.version)}, but the app's SDK speaks ${PROTOCOL_VERSIONS.join(", ")}.`,
           ),
         );
         return;
       }
       const connection = new Connection(port);
       connection
-        .call("hello", { sdk: SDK_VERSION, protocol: PROTOCOL_VERSION })
-        .then((context) => resolve(buildMisty(connection, context, options)))
+        .call("hello", { sdk: SDK_VERSION, protocol, versions: [...PROTOCOL_VERSIONS] })
+        .then((context) => resolve(buildMisty(connection, { ...context, protocol: context.protocol ?? protocol }, options)))
         .catch((error: unknown) => {
           connection.close();
           reject(error instanceof Error ? error : new MistyError("internal", String(error)));

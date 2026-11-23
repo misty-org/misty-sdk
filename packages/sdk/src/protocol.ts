@@ -1,9 +1,11 @@
 import type {
+  AgentControl,
   AppContext,
   CallState,
   Card,
   ChatTarget,
   FileChange,
+  FileFormat,
   FilePage,
   FileRef,
   ListFilesOptions,
@@ -19,18 +21,18 @@ import type {
   VoiceChannel,
 } from "./types.js";
 
-/** Bumped when a frame or a call changes in a way an older app can't follow. */
 export const PROTOCOL_VERSION = 1;
 
-/** The one `window.postMessage` the host sends a new frame; its `ports[0]` is the SDK channel. */
+export const PROTOCOL_VERSIONS: readonly number[] = [1];
+
 export const INIT_MESSAGE = "misty:init";
 
 export interface InitMessage {
   type: typeof INIT_MESSAGE;
   version: number;
+  versions?: number[];
 }
 
-/** Everything that crosses the channel is one of these frames. */
 export type Frame =
   | { t: "req"; id: number; method: string; params?: unknown }
   | { t: "res"; id: number; ok: true; result?: unknown }
@@ -38,9 +40,7 @@ export type Frame =
   | { t: "sub"; id: number; topic: string; params?: unknown }
   | { t: "unsub"; id: number }
   | { t: "evt"; id: number; data: unknown }
-  /** The host ended a subscription, with an error when it failed. */
   | { t: "end"; id: number; error?: WireError }
-  /** One JSON-RPC message of the app's MCP stream (`mcp: frame`). */
   | { t: "mcp"; message: unknown };
 
 export type ErrorCode =
@@ -61,11 +61,26 @@ export interface WireError {
 export interface Hello {
   sdk: string;
   protocol: number;
+  versions?: number[];
 }
 
-/** One-shot calls: `[params, result]` for each method. */
+export interface Offers {
+  calls: string[];
+  topics: string[];
+}
+
+export interface HelloResult extends AppContext {
+  protocol?: number;
+  versions?: number[];
+  offers?: Offers;
+}
+
+export type RoomParams =
+  | { id: string; gc?: boolean; sync?: boolean }
+  | { file: string; gc?: boolean; sync?: boolean };
+
 export interface Methods {
-  hello: [Hello, AppContext];
+  hello: [Hello, HelloResult];
   "members.list": [void, Member[]];
   "members.mentionables": [{ query: string }, Mentionable[]];
   "chat.post": [{ target: ChatTarget; spans: Span[]; card?: Card }, { message_id: string }];
@@ -80,26 +95,64 @@ export interface Methods {
   "route.navigate": [{ route: Route; replace?: boolean }, void];
   "room.update": [{ id: string; update: Uint8Array }, void];
   "room.awareness": [{ id: string; update: Uint8Array }, void];
+  "room.sync": [{ id: string; message: Uint8Array }, { messages: Uint8Array[] }];
+  "room.serialized": [{ id: string; request: number; data?: Uint8Array; error?: string }, void];
   "calls.join": [{ channel_id: string }, void];
   "calls.leave": [void, void];
   "calls.mute": [{ muted: boolean }, void];
 }
 
-export type RoomEvent = { type: "sync"; update: Uint8Array } | { type: "awareness"; update: Uint8Array };
+export type RoomEvent =
+  | { type: "sync"; update: Uint8Array }
+  | { type: "awareness"; update: Uint8Array }
+  | { type: "message"; message: Uint8Array }
+  | { type: "file"; file: FileRef; format: FileFormat; writer: boolean }
+  | { type: "load"; request: number; version: number; data: ArrayBuffer }
+  | { type: "serialize"; request: number };
 
-/** Subscriptions: `[params, event]` for each topic. The host sends the current value first. */
+export interface WatchOptions {
+  folder?: string;
+  accept?: string[];
+  default_folder?: boolean;
+}
+
 export interface Topics {
   theme: [void, Theme];
   route: [void, Route];
   "members.presence": [void, Presence[]];
-  "files.watch": [{ folder?: string; accept?: string[] } | void, FileChange];
-  room: [{ id: string; gc?: boolean }, RoomEvent];
+  "files.watch": [WatchOptions | void, FileChange];
+  room: [RoomParams, RoomEvent];
   "calls.channels": [void, VoiceChannel[]];
   "calls.current": [void, CallState];
+  "agents.control": [void, AgentControl];
 }
 
 export type MethodName = keyof Methods;
 export type TopicName = keyof Topics;
+
+export const FIRST_OFFERS: Offers = {
+  calls: [
+    "hello",
+    "members.list",
+    "members.mentionables",
+    "chat.post",
+    "chat.open",
+    "chat.notify",
+    "files.pick",
+    "files.open",
+    "files.save",
+    "files.list",
+    "files.upload",
+    "files.download",
+    "route.navigate",
+    "room.update",
+    "room.awareness",
+    "calls.join",
+    "calls.leave",
+    "calls.mute",
+  ],
+  topics: ["theme", "route", "members.presence", "files.watch", "room", "calls.channels", "calls.current"],
+};
 
 export const isFrame = (value: unknown): value is Frame =>
   typeof value === "object" && value !== null && typeof (value as { t?: unknown }).t === "string";

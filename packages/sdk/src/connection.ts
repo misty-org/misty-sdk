@@ -2,7 +2,6 @@ import { MistyError } from "./errors.js";
 import { isFrame } from "./protocol.js";
 import type { Frame, MethodName, Methods, TopicName, Topics } from "./protocol.js";
 
-/** The slice of `MessagePort` the SDK needs, so tests and hosts can supply their own end. */
 export interface Channel {
   postMessage(message: unknown, transfer?: Transferable[]): void;
   onmessage: ((event: MessageEvent) => void) | null;
@@ -12,7 +11,6 @@ export interface Channel {
 
 export type Unsubscribe = () => void;
 
-/** The params of a call: optional when the call takes none or they may be left out. */
 export type CallArgs<M extends MethodName> = [void] extends [Methods[M][0]]
   ? [params?: Methods[M][0]]
   : [params: Methods[M][0]];
@@ -23,7 +21,6 @@ interface Subscription {
   onEnd?: (error?: MistyError) => void;
 }
 
-/** Request/response, subscriptions and the MCP stream, multiplexed over one channel. */
 export class Connection {
   private nextId = 1;
   private closed = false;

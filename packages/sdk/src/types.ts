@@ -1,21 +1,20 @@
-/** Shapes the SDK hands to apps. Records keep the server's own field names (snake_case). */
-
 export type SpaceRole = "owner" | "member";
 
 export interface Space {
   id: string;
   name: string;
   description?: string;
-  /** Whether the person is a mod of this Space (may install apps). */
   is_mod: boolean;
 }
+
+export type AvatarTone = "red" | "orange" | "yellow" | "green" | "blue" | "purple" | "gray";
 
 export interface Me {
   user_id: string;
   name: string;
   role: SpaceRole;
-  /** Names the person's picture; 0 or missing when there is none. */
   avatar_version?: number;
+  tone?: AvatarTone;
 }
 
 export interface Member {
@@ -24,15 +23,30 @@ export interface Member {
   role: SpaceRole;
   avatar_version?: number;
   joined_at: string;
+  tone?: AvatarTone;
 }
 
 export type PresenceState = "online" | "offline";
 
+export type PresenceStatus = "online" | "idle" | "dnd" | "offline";
+
 export interface Presence {
   user_id: string;
   state: PresenceState;
-  /** True while one of the member's agents is working in the Space. */
   working: boolean;
+  status?: PresenceStatus;
+  app_id?: string;
+}
+
+export interface Identity {
+  user_id: string;
+  name: string;
+  tone: AvatarTone | null;
+}
+
+export interface AgentControl {
+  agent: { id: string; name: string; user_id: string } | null;
+  driver: "person" | "agent";
 }
 
 export interface Mentionable {
@@ -43,9 +57,8 @@ export interface Mentionable {
 
 export interface Theme {
   mode: "light" | "dark";
-  /** CSS custom properties, such as `--misty-theme-bg`, to set on the document root. */
   tokens: Record<string, string>;
-  fonts: { sans: string; mono: string; /** `@font-face` rules the host serves, if any. */ css?: string };
+  fonts: { sans: string; mono: string; css?: string };
 }
 
 export interface Route {
@@ -53,37 +66,41 @@ export interface Route {
   params: Record<string, string>;
 }
 
-/** A piece of message text. */
 export type Span =
   | { kind: "text"; text: string }
   | { kind: "mention"; mention: Pick<Mentionable, "kind" | "id"> }
   | { kind: "link"; url: string; text?: string };
 
-/** The Open card an APP message carries. */
 export interface Card {
   title: string;
-  /** One short line under the title. */
   detail?: string;
-  /** Where Open leads, inside this app. */
   route?: Route;
   file_id?: string;
 }
 
 export type ChatTarget = { channel: string } | { dm: string };
 
+export interface FileUse {
+  user_id: string;
+  name: string;
+  editing: boolean;
+  you: boolean;
+}
+
 export interface FileRef {
   id: string;
   name: string;
   mime: string;
   size: number;
-  /** The id of the app that made or last saved it, when one did. */
   app_id?: string;
   folder?: string;
   updated_at: string;
+  in_use?: FileUse[];
 }
 
+export type FileFormat = "text" | "app";
+
 export interface PickOptions {
-  /** Kinds to offer, such as `image/*` or `.psd`. Defaults to the app's manifest kinds. */
   accept?: string[];
   multiple?: boolean;
 }
@@ -91,7 +108,6 @@ export interface PickOptions {
 export interface SaveOptions {
   name: string;
   mime: string;
-  /** Where to save in the Space's drive. The app's own folder (`/<App name>/`) when left out. */
   folder?: string;
   data: ArrayBuffer | Uint8Array | Blob;
 }
@@ -117,18 +133,14 @@ export interface UploadOptions {
   data: ArrayBuffer | Uint8Array | Blob;
 }
 
-/** What an app can ask for in `misty-app.json`. The mod approves these once, at install. */
 export type Permission = "files" | "chat.post" | "rooms" | "members" | "calls";
 
-/** One of the Space's voice channels, and who is in it now. */
 export interface VoiceChannel {
   channel_id: string;
   name: string;
-  /** The user ids of the people in it, each once. */
   people: string[];
 }
 
-/** This window's call: the voice channel it is in (null when none) and whether its microphone is on. */
 export interface CallState {
   channel_id: string | null;
   mic_on: boolean;
@@ -140,18 +152,14 @@ export interface AppManifest {
   id: string;
   name: string;
   version: string;
-  /** A 64×64 SVG on the app's tile color. */
   logo: string;
   entry: string;
-  /** Kinds of Space file the app opens, such as `image/*` or `.psd`. */
   opens?: string[];
   permissions: Permission[];
   mcp?: McpKind;
-  /** The app needs its own webview instead of a sandboxed frame. */
   webview?: boolean;
 }
 
-/** What the host sends when the app starts. */
 export interface AppContext {
   app_id: string;
   space: Space;

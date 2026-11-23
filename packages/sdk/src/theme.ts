@@ -2,7 +2,6 @@ import type { Theme } from "./types.js";
 
 const FONT_STYLE_ID = "misty-theme-fonts";
 
-/** Sets the host's tokens and fonts on the document so the app matches Misty. Safe to call again. */
 export function applyTheme(theme: Theme, doc: Document = document): void {
   const root = doc.documentElement;
   for (const [name, value] of Object.entries(theme.tokens)) root.style.setProperty(name, value);

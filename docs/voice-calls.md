@@ -5,7 +5,7 @@ order: 6
 
 # Voice calls
 
-A Space's voice channels are calls people drop into, as in Discord: no ringing, and whoever is in a channel
+A Space's voice channels are calls people drop into: no ringing, and whoever is in a channel
 hears everyone else in it. With the `calls` permission an app can show them in its own interface and steer
 the person's call. The call itself runs in Misty's window, end-to-end encrypted between the people's
 computers; an app never touches its sound or video, and neither does the Space's server.
@@ -24,22 +24,6 @@ await misty.calls.setMuted(true);
 await misty.calls.leave();
 ```
 
-`people` are user ids; `misty.members.list()` names them. A voice channel holds at most 8 people, and
+`people` are user ids; `misty.members.list()` names them. `misty.live.voiceChannels()` and `misty.live.call()`
+hold the same as values ([Live values](live-values.md)). A voice channel holds at most 8 people, and
 `join` fails with `not_found` for a channel that isn't one of the Space's voice channels.
-
-In React:
-
-```tsx
-import { Button } from "@misty/ui";
-import { useCall, useVoiceChannels } from "@misty/sdk-react";
-
-function VoiceBar() {
-  const channels = useVoiceChannels();
-  const call = useCall();
-  return (channels.value ?? []).map((channel) => (
-    <Button key={channel.channel_id} variant="quiet" onClick={() => void call.join(channel.channel_id)}>
-      {`${channel.name} (${channel.people.length})`}
-    </Button>
-  ));
-}
-```

@@ -1,5 +1,3 @@
-/* Misty's look for apps built on the SDK. These are the dark defaults; the host sends the person's
-   real tokens at start and on every theme change, and `applyTheme` sets them on the root. */
 :root {
   color-scheme: dark;
   --misty-theme-bg: #131313;

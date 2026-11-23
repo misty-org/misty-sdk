@@ -1,6 +1,5 @@
 import type { ErrorCode, WireError } from "./protocol.js";
 
-/** An error the host answered a call with, or that ended a subscription. */
 export class MistyError extends Error {
   readonly code: ErrorCode;
 

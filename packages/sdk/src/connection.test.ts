@@ -3,7 +3,6 @@ import { Connection } from "./connection.js";
 import { MistyError } from "./errors.js";
 import type { Frame } from "./protocol.js";
 
-/** A host end that answers frames by hand, over a real MessageChannel. */
 function pair() {
   const { port1, port2 } = new MessageChannel();
   const connection = new Connection(port1);
