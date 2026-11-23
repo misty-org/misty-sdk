@@ -123,6 +123,10 @@ export function createMisty(channel: Channel, context: HelloResult, options: Cre
 
 const MAX_LISTED_PAGES = 50;
 
+const MAX_EARLY_CHANGES = 1_000;
+
+const MAX_LIST_ATTEMPTS = 3;
+
 function buildMisty(connection: Connection, context: HelloResult, options: CreateMistyOptions): Misty {
   const offers: Offers = context.offers ?? FIRST_OFFERS;
   const offered = new Set([...offers.calls, ...offers.topics]);
@@ -173,6 +177,7 @@ function buildMisty(connection: Connection, context: HelloResult, options: Creat
     live<FileRef[]>((set, fail) => {
       const files = new Map<string, FileRef>();
       const early: FileChange[] = [];
+      let overflowed = false;
       let listed = false;
       let closed = false;
       const publish = () =>
@@ -188,36 +193,58 @@ function buildMisty(connection: Connection, context: HelloResult, options: Creat
         "files.watch",
         watch,
         (change) => {
+          if (closed) return;
           if (!listed) {
-            early.push(change);
+            if (early.length < MAX_EARLY_CHANGES) early.push(change);
+            else overflowed = true;
             return;
           }
           apply(change);
           publish();
         },
-        (error) => fail(error ?? new MistyError("closed", "Misty stopped watching these files.")),
+        (error) => {
+          if (closed) return;
+          closed = true;
+          early.length = 0;
+          fail(error ?? new MistyError("closed", "Misty stopped watching these files."));
+        },
       );
-      void (async () => {
-        let cursor: string | undefined;
-        for (let page = 0; page < MAX_LISTED_PAGES; page += 1) {
-          const result = await connection.call("files.list", {
-            folder: filesOptions.folder,
-            accept: filesOptions.accept,
-            cursor,
-          });
-          for (const found of result.files) files.set(found.id, found);
-          cursor = result.next_cursor;
-          if (!cursor) break;
+      const list = async () => {
+        for (let attempt = 0; attempt < MAX_LIST_ATTEMPTS; attempt += 1) {
+          overflowed = false;
+          files.clear();
+          let cursor: string | undefined;
+          for (let page = 0; page < MAX_LISTED_PAGES; page += 1) {
+            const result = await connection.call("files.list", {
+              folder: filesOptions.folder,
+              accept: filesOptions.accept,
+              cursor,
+            });
+            if (closed) return;
+            for (const found of result.files) files.set(found.id, found);
+            cursor = result.next_cursor;
+            if (!cursor) break;
+          }
+          if (!overflowed) {
+            listed = true;
+            for (const change of early.splice(0)) apply(change);
+            publish();
+            return;
+          }
+          early.length = 0;
         }
+        throw new MistyError("internal", "These files changed too often to list.");
+      };
+      list().catch((error: unknown) => {
         if (closed) return;
-        listed = true;
-        for (const change of early.splice(0)) apply(change);
-        publish();
-      })().catch((error: unknown) => {
-        if (!closed) fail(error instanceof MistyError ? error : new MistyError("internal", String(error)));
+        closed = true;
+        early.length = 0;
+        stop();
+        fail(error instanceof MistyError ? error : new MistyError("internal", String(error)));
       });
       return () => {
         closed = true;
+        early.length = 0;
         stop();
       };
     });
@@ -324,21 +351,72 @@ if (typeof window !== "undefined") {
   });
 }
 
+const helloParams = (protocol: number) => ({ sdk: SDK_VERSION, protocol, versions: [...PROTOCOL_VERSIONS] });
+
+function followRestarts(connection: Connection, first: MessagePort, protocol: number, context: HelloResult): void {
+  let current = first;
+  const onMessage = (event: MessageEvent) => {
+    const start = startMessageOf(event);
+    if (!start || start.port === current) return;
+    if (early?.port === start.port) early = undefined;
+    current = start.port;
+    if (pickProtocol(start) !== protocol) {
+      start.port.close();
+      connection.close();
+      return;
+    }
+    connection.replace(start.port);
+    connection.call("hello", helloParams(protocol)).then(
+      (next) => {
+        const same =
+          next.app_id === context.app_id &&
+          next.space.id === context.space.id &&
+          next.me.user_id === context.me.user_id;
+        if (same) connection.resume();
+        else connection.close();
+      },
+      () => connection.close(),
+    );
+  };
+  window.addEventListener("message", onMessage);
+  connection.onClose(() => window.removeEventListener("message", onMessage));
+}
+
 export function connect(options: ConnectOptions = {}): Promise<Misty> {
   const timeoutMs = options.timeoutMs ?? 10_000;
   return new Promise<Misty>((resolve, reject) => {
-    const waiting: { timer?: ReturnType<typeof setTimeout> } = {};
-    const cleanup = () => {
-      window.removeEventListener("message", onMessage);
-      clearTimeout(waiting.timer);
+    let settled = false;
+    let opened: Connection | undefined;
+    const onMessage = (event: MessageEvent) => {
+      const start = startMessageOf(event);
+      if (start) begin(start);
     };
-    const begin = (start: StartMessage) => {
-      cleanup();
+    const timer = setTimeout(() => {
+      fail(
+        opened
+          ? new MistyError("internal", "Misty didn't answer the app in time.")
+          : new MistyError("unsupported", "This page isn't running inside Misty."),
+      );
+    }, timeoutMs);
+    const finish = () => {
+      settled = true;
+      clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+    };
+    function fail(error: Error) {
+      if (settled) return;
+      finish();
+      opened?.close();
+      reject(error);
+    }
+    function begin(start: StartMessage) {
+      if (settled || opened) return;
+      window.removeEventListener("message", onMessage);
       const { port } = start;
       const protocol = pickProtocol(start);
       if (protocol === null) {
         port.close();
-        reject(
+        fail(
           new MistyError(
             "unsupported",
             `This Misty speaks protocol ${String(start.versions ?? start.version)}, but the app's SDK speaks ${PROTOCOL_VERSIONS.join(", ")}.`,
@@ -347,28 +425,24 @@ export function connect(options: ConnectOptions = {}): Promise<Misty> {
         return;
       }
       const connection = new Connection(port);
+      opened = connection;
       connection
-        .call("hello", { sdk: SDK_VERSION, protocol, versions: [...PROTOCOL_VERSIONS] })
-        .then((context) => resolve(buildMisty(connection, { ...context, protocol: context.protocol ?? protocol }, options)))
-        .catch((error: unknown) => {
-          connection.close();
-          reject(error instanceof Error ? error : new MistyError("internal", String(error)));
-        });
-    };
-    const onMessage = (event: MessageEvent) => {
-      const start = startMessageOf(event);
-      if (start) begin(start);
-    };
+        .call("hello", helloParams(protocol))
+        .then((context) => {
+          if (settled) return;
+          finish();
+          const spoken = context.protocol ?? protocol;
+          followRestarts(connection, port, spoken, context);
+          resolve(buildMisty(connection, { ...context, protocol: spoken }, options));
+        })
+        .catch((error: unknown) => fail(error instanceof Error ? error : new MistyError("internal", String(error))));
+    }
     if (early) {
       const start = early;
       early = undefined;
       begin(start);
       return;
     }
-    waiting.timer = setTimeout(() => {
-      cleanup();
-      reject(new MistyError("unsupported", "This page isn't running inside Misty."));
-    }, timeoutMs);
     window.addEventListener("message", onMessage);
   });
 }

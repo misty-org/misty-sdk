@@ -4,8 +4,11 @@ Build apps for a Misty Space: Space files, live Yjs rooms, presence, chat, voice
 Misty's channel. One package for any web build, whatever framework or language it's made with. MIT.
 
 ```bash
-npm install @misty/sdk
+npm install @misty/sdk yjs y-protocols lib0
 ```
+
+Yjs, `y-protocols` and `lib0` are peer dependencies, so the app, the SDK and an editor's Yjs binding share one copy.
+The no-build script, `misty-sdk.js`, carries its own.
 
 ```ts
 import { connect } from "@misty/sdk";

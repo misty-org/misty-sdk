@@ -23,8 +23,13 @@ room.onLost((error) => {
 room.destroy(); // leave, and free the document
 ```
 
-Pass `{ gc: false }` to keep deleted content in the document, on the app's side and Misty's, for an app that
-undoes its own history or shows who deleted what.
+One app holds one copy of a room: opening a room id that is already open throws a `MistyError` with code
+`conflict`. Use the open one, or destroy it first.
+
+Pass `{ gc: false }` to keep deleted content in the document, for an app that undoes its own history or shows who
+deleted what. Misty keeps it on the app's side and in its own copy of the room. A Space's server that doesn't keep
+deleted content yet still collects it there, so content deleted before everyone has closed the room may not come
+back on a fresh load.
 
 Each person works on their own copy and the changes merge. Nothing of one person's screen goes to another.
 
@@ -32,23 +37,49 @@ Each person works on their own copy and the changes merge. Nothing of one person
 
 The room and Misty compare what each has (Yjs state vectors) when it opens and whenever Misty's own connection to
 the server comes back, so nothing is missed across a reload or a dropped connection. If an update can't be
-delivered, the room compares again and sends what is missing, rather than dropping it. `room.onError(listener)`
-hears each such problem; `onLost` is only for a room that has stopped for good.
+delivered, the room compares again and sends what is missing, rather than dropping it, waiting a little longer
+after each failure in a row (up to half a minute). If Misty stops the room for a passing reason, the room opens
+again on its own with the same document, a few times before it gives up.
+
+`room.onError(listener)` hears each such problem; `onLost` is only for a room that has stopped for good. Besides
+the error codes every call has, a room can say:
+
+| Code | What it means |
+| --- | --- |
+| `too_large` | The room reached the server's size limit: edits are not being saved |
+| `too_large_warning` | The room is close to that limit |
+| `stalled` | The room hasn't come into step in a while; Misty is still trying |
+| `read_only` | This person can't edit here |
+| `save_failed` | A file room couldn't save the file; the message says why |
+| `reloaded` | The room was replaced on the server. The room stops (`onLost` hears `reloaded`) so its old content isn't pushed into the new one: open it again |
+
+`room.synced` waits until the room is in step. While it can't be, `onError` says why, and every call to Misty
+gives up after a while with an error rather than waiting forever.
+
+`room.connected` says whether Misty's link to the server for this room is up, and `room.onConnection(listener)`
+hears it change. Edits made while it's down are kept and sent when it comes back. Misty sends `connection` events
+only where `misty.supports("room.connection")`; on an older Misty, `connected` stays `true`. Problems other than
+failed calls need `misty.supports("room.problem")`.
 
 ## Who is who
 
 Each person's awareness state carries Misty's own field, `misty`: `{ user_id, name, tone }`, with `tone` their
 avatar color (`red`, `orange`, `yellow`, `green`, `blue`, `purple` or `gray`). Misty fills it in and the server
-refuses any state that names someone else, so a cursor's name can be trusted. The app's own fields are its own.
+refuses any state that names someone else, so trust a name only when it comes from this field, through
+`room.identity(client)`. Every other field is whatever that person's copy of the app wrote, a name included.
 
 ```ts
 for (const [client, state] of room.awareness.getStates()) {
   const who = room.identity(client); // { user_id, name, tone } or null
-  drawCursor(state.cursor, who?.name, who?.tone);
+  if (who) drawCursor(state.cursor, who.name, who.tone);
 }
 ```
 
-`room.identity(room.doc.clientID)` is the person using the app.
+`room.identity(room.doc.clientID)` is the person using the app. A state with no `misty` field is nobody Misty
+vouches for: the editor bindings don't draw it.
+
+Someone's awareness lasts as long as their connection: it isn't timed out while they sit still, and it goes when
+they leave.
 
 ## A file as a live document
 
@@ -58,25 +89,42 @@ keeps everyone's copies in step and saves it, and the app only turns the documen
 ```ts
 const room = misty.room.forFile(file.id, {
   load: (data, doc) => {
-    // the room is new: fill `doc` from the file's bytes
+    // the room is new: fill `doc`, the document handed in, from the file's bytes
     importScene(doc, new TextDecoder().decode(data));
   },
   serialize: (doc) => exportScene(doc), // Uint8Array, ArrayBuffer, Blob or string
 });
-await room.ready; // synced, and Misty has said what the file is
+await room.ready; // synced, Misty has said what the file is, and its content is in the room
 
 room.format; // "text" or "app"
 room.writer; // whether this copy saves the file
+room.loaded; // whether the file's content is in the room
+room.editable; // whether this person can edit it
 room.onWriter((writer) => {});
 ```
 
 - **Plain text** (Markdown, code, CSV and the like) is `format: "text"`: the document is `room.text`, a `Y.Text`,
   and the server saves it into the file itself. Bind an editor to it; no `load` or `serialize` is needed.
-- **Anything else** is `format: "app"`: the document is the app's own, in a room of its own for this app and file.
-  One open copy holds the writer's lease, held on the server by its connection and passed on to another open copy
+- **Anything else** is `format: "app"`: the document is the app's own, in a room of its own for this app and file,
+  and the app must give both `load` and `serialize`. Without them the room stops as soon as Misty says the file's
+  format, with code `unsupported`, rather than open a file it could never save.
+- One open copy holds the writer's lease, held on the server by its connection and passed on to another open copy
   when it closes, with no timer and no election among apps. Misty calls `load` on that copy when the room is new,
   and `serialize` when the room has changed, and saves what it returns. Nothing unsaved is lost in between: it
   lives in the room on the server until a writer saves it.
+- `load` fills a fresh document of its own, which may take as long as it needs; the room then takes it in one
+  change, together with the mark that says the room is loaded, so a room is never half loaded or loaded twice.
+  Fill the `doc` it's given, not `room.doc`. If `load` throws, or takes more than 100 seconds, `onError` hears it
+  and the room stays open; Misty asks once more, and a second failure rejects `ready`. A load that finishes after
+  this copy stopped being the writer is dropped, since the new writer loads the file itself.
+- `serialize` is only asked once the room is in step and loaded. If it throws, or the save fails, `onError` hears
+  it; the room stays open.
+- `ready` rejects with `read_only` when nobody who can edit the file has it open, so its content isn't in the room
+  and can't be shown live. Fall back to `misty.files.download`. It rejects with `stalled` when the content
+  hasn't arrived five minutes after the room is in step.
+- A `problem` with code `reloaded` ends the room: the file changed somewhere else while nothing here was unsaved,
+  so the room was opened afresh from it. Open the file again.
 - The file is marked in use by this person while the room is open.
 
-`forFile` needs a Misty that has it: check `misty.supports("room.sync")` first.
+`forFile` needs a Misty that has it: check `misty.supports("room.sync")` first. On a Misty that doesn't say
+whether the file is loaded, `ready` waits only for the room to be in step.

@@ -1,5 +1,5 @@
 import type { Unsubscribe } from "./connection.js";
-import { MistyError } from "./errors.js";
+import { MistyError, safely } from "./errors.js";
 
 export type LiveStatus = "waiting" | "ready" | "failed";
 
@@ -21,12 +21,13 @@ const WAITING: LiveValue<never> = Object.freeze({ status: "waiting", value: unde
 export function live<T>(source: LiveSource<T>): Live<T> {
   let current: LiveValue<T> = WAITING;
   let stop: Unsubscribe | undefined;
+  let active = false;
   let generation = 0;
   const listeners = new Set<(value: LiveValue<T>) => void>();
 
   const publish = (next: LiveValue<T>) => {
     current = next;
-    for (const listener of [...listeners]) listener(next);
+    for (const listener of [...listeners]) safely(() => listener(next));
   };
 
   const start = () => {
@@ -38,22 +39,32 @@ export function live<T>(source: LiveSource<T>): Live<T> {
       if (mine !== generation) return;
       publish(Object.freeze({ status: "failed", value: current.value, error }));
     };
+    let teardown: Unsubscribe | undefined;
     try {
-      stop = source(set, fail);
+      teardown = source(set, fail);
     } catch (error) {
       fail(error instanceof MistyError ? error : new MistyError("internal", String(error)));
     }
+    if (mine !== generation) {
+      teardown?.();
+      return;
+    }
+    stop = teardown;
   };
 
   return {
     get: () => current,
     subscribe(listener) {
       listeners.add(listener);
-      if (listeners.size === 1 && !stop) start();
-      listener(current);
+      if (!active) {
+        active = true;
+        start();
+      }
+      if (listeners.has(listener)) safely(() => listener(current));
       return () => {
         if (!listeners.delete(listener) || listeners.size > 0) return;
         generation += 1;
+        active = false;
         const running = stop;
         stop = undefined;
         current = WAITING;

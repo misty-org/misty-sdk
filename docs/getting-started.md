@@ -10,8 +10,10 @@ live rooms and theme. Every call is checked by Misty against the permissions the
 app was installed.
 
 ```bash
-npm install @misty/sdk
+npm install @misty/sdk yjs y-protocols lib0
 ```
+
+Yjs and its two helpers are peer dependencies, so the app, the SDK and any editor binding share one copy.
 
 ```ts
 import { connect } from "@misty/sdk";
@@ -22,8 +24,13 @@ console.log(misty.space().name, misty.me().name);
 await misty.chat.post({ channel: "general" }, [{ kind: "text", text: "Hello" }]);
 ```
 
-`connect()` waits for Misty to start the app, then resolves with the client. It rejects when the page isn't
-running inside Misty, after `timeoutMs` (10 seconds by default).
+`connect()` waits for Misty to start the app and answer its hello, then resolves with the client. It rejects when
+the page isn't running inside Misty, or Misty doesn't answer, after `timeoutMs` (10 seconds by default).
+
+If Misty restarts the app's channel, the client moves over on its own: subscriptions start again, rooms come back
+into step, and calls that were waiting fail with `internal`. If it can't (Misty now speaks for another app, Space
+or person), the client closes; `misty.onClose(listener)` hears it, and the app should reload. Every call gives up
+with `internal` when Misty doesn't answer in time: a minute for most, longer for picking and moving files.
 
 ## The client
 
@@ -45,7 +52,10 @@ running inside Misty, after `timeoutMs` (10 seconds by default).
 ## Permissions
 
 The manifest, `misty-app.json`, lists what the app asks for: `files`, `chat.post`, `rooms`, `members` and
-`calls`. A call outside what was approved rejects with a `MistyError` whose `code` is `permission_denied`.
+`calls`. `misty.permissions` is what Misty says the Space's mod approved, which may be less than the manifest
+asks; don't assume the app got what it asked for. A call outside what was approved rejects with a `MistyError`
+whose `code` is `permission_denied`, and that can still happen to a call `permissions` lists, for instance after
+the mod changes what the app may do.
 
 ## Older and newer Misty
 
@@ -58,13 +68,17 @@ if (misty.supports("room.sync")) {
 }
 ```
 
+`supports(name)` takes the name of a call (`room.sync`, `room.serialized`), a topic (`agents.control`) or a feature
+of one (`room.connection`, `room.problem`: the room events of those names).
+
 The protocol underneath is written up in [Wire protocol](protocol.md), for an app that speaks it without this
 package.
 
 ## Errors
 
 Every failure is a `MistyError` with a `code`: `permission_denied`, `not_found`, `conflict`, `invalid`,
-`unsupported`, `cancelled`, `closed` or `internal`.
+`unsupported`, `cancelled`, `closed` or `internal`. A live room adds its own (`too_large`, `stalled`, `read_only`
+and the rest), listed in [Live rooms](live-rooms.md#staying-in-step).
 
 ## Theme
 

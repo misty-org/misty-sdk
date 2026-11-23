@@ -13,3 +13,13 @@ export class MistyError extends Error {
     return new MistyError(error.code, error.message);
   }
 }
+
+export function safely(run: () => void): void {
+  try {
+    run();
+  } catch (error) {
+    queueMicrotask(() => {
+      throw error;
+    });
+  }
+}

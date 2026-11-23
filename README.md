@@ -24,8 +24,8 @@ const misty = await connect();
 await misty.chat.post({ channel: "general" }, [{ kind: "text", text: "Hello" }]);
 ```
 
-Misty's own Code and Lab pages use this same client for their live rooms, presence and cursors, so the SDK has no
-powers an app lacks.
+Misty's own Code and Lab pages, parked for now in `misty-code` and `misty-lab`, use this same client, so the SDK
+has no powers an app lacks. For now they speak the protocol's first version, without its syncing and file rooms.
 
 ## Live rooms
 
@@ -43,12 +43,18 @@ room.onLost((error) => {
 room.destroy(); // leave, and free the document
 ```
 
-Pass `{ gc: false }` to keep deleted content in the document (on the app's side and Misty's), for an app that
-undoes its own history or shows who deleted what. Each awareness state carries Misty's own `misty` field (the
-person's id, name and avatar tone), which the app can't set or fake; `room.identity(clientId)` reads it.
+Pass `{ gc: false }` to keep deleted content in the document (on the app's side and in Misty's copy), for an app
+that undoes its own history or shows who deleted what; a Space's server that doesn't keep it yet still collects it
+there. Each awareness state carries Misty's own `misty` field (the person's id, name and avatar tone), which the
+app can't set or fake; `room.identity(clientId)` reads it. Trust a name only from there: every other awareness
+field is whatever the other copy of the app wrote.
+
+A room says whether Misty's link to the server is up (`room.connected`, `onConnection`), hears problems such as a
+room that is too large (`onError`), and opens itself again after a passing failure.
 
 `room.forFile(fileId)` opens a Space file as a live document: plain text is saved by the server, and anything else
-is saved by the one open copy that holds the writer's lease, through the app's own `serialize`.
+is saved by the one open copy that holds the writer's lease, through the app's own `load` and `serialize`.
+`room.ready` waits until the file's content is in the room.
 
 ## Bindings and a script with no build step
 

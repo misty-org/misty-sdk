@@ -4,7 +4,7 @@ import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protoc
 import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
 import type { Connection, Unsubscribe } from "./connection.js";
-import { MistyError } from "./errors.js";
+import { MistyError, safely } from "./errors.js";
 import type { RoomEvent, RoomParams } from "./protocol.js";
 import type { AvatarTone, FileFormat, FileRef, Identity } from "./types.js";
 
@@ -24,8 +24,10 @@ export interface Room {
   readonly awareness: Awareness;
   readonly synced: Promise<void>;
   readonly lost: MistyError | null;
+  readonly connected: boolean;
   onLost(listener: (error: MistyError) => void): Unsubscribe;
   onError(listener: (error: MistyError) => void): Unsubscribe;
+  onConnection(listener: (connected: boolean) => void): Unsubscribe;
   identity(clientId: number): Identity | null;
   destroy(): void;
 }
@@ -43,6 +45,8 @@ export interface FileRoom extends Room {
   readonly format: FileFormat | null;
   readonly text: Y.Text;
   readonly writer: boolean;
+  readonly loaded: boolean;
+  readonly editable: boolean;
   readonly ready: Promise<void>;
   onFile(listener: (file: FileRef) => void): Unsubscribe;
   onWriter(listener: (writer: boolean) => void): Unsubscribe;
@@ -55,9 +59,32 @@ export interface RoomHost {
 
 const REMOTE = Symbol("misty-room-remote");
 
+const LOADING = Symbol("misty-room-load");
+
 const TONES: ReadonlySet<string> = new Set(["red", "orange", "yellow", "green", "blue", "purple", "gray"]);
 
 const FATAL: ReadonlySet<string> = new Set(["closed", "not_found", "permission_denied", "cancelled"]);
+
+const REOPENS: ReadonlySet<string> = new Set(["internal"]);
+
+const MAX_REOPENS = 8;
+
+const LOAD_BOUND_MS = 100_000;
+
+const MAX_LOAD_FAILURES = 2;
+
+const READY_BOUND_MS = 300_000;
+
+const RETRY_BASE_MS = 500;
+
+const RETRY_MAX_MS = 30_000;
+
+const backoff = (attempt: number): number => {
+  const ceiling = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** attempt);
+  return ceiling / 2 + Math.random() * (ceiling / 2);
+};
+
+const openIds = new WeakMap<Connection, Set<string>>();
 
 function identityOf(state: unknown): Identity | null {
   if (typeof state !== "object" || state === null) return null;
@@ -88,6 +115,10 @@ async function fileBytes(data: FileData): Promise<Uint8Array> {
 const asError = (error: unknown): MistyError =>
   error instanceof MistyError ? error : new MistyError("internal", error instanceof Error ? error.message : String(error));
 
+function stopOutdatedCheck(awareness: Awareness): void {
+  clearInterval((awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> })._checkInterval);
+}
+
 export function openRoom(connection: Connection, id: string, options: RoomOptions, host: RoomHost): Room {
   return open(connection, { id }, id, options, host);
 }
@@ -108,17 +139,38 @@ function open(
   options: FileRoomOptions,
   host: RoomHost,
 ): Room | FileRoom {
+  const taken = openIds.get(connection) ?? new Set<string>();
+  if (taken.has(wireId)) {
+    throw new MistyError("conflict", "This room is already open in this app. Use the open one, or destroy it first.");
+  }
+  taken.add(wireId);
+  openIds.set(connection, taken);
+  const release = () => taken.delete(wireId);
+
+  const isFile = "file" in target;
   const gc = options.gc ?? true;
   const doc = new Y.Doc({ gc });
   const awareness = new Awareness(doc);
+  stopOutdatedCheck(awareness);
   const syncs = host.syncs;
   let destroyed = false;
   let lost: MistyError | null = null;
+  let subscribed = false;
+  let generation = 0;
   let dirty = syncs;
   let awarenessDirty = false;
   let resyncing = false;
+  let retries = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+  let reopens = 0;
+  let reopening = false;
+  let reopenTimer: ReturnType<typeof setTimeout> | undefined;
+  let connected = true;
+  let isSynced = false;
+  const held: Uint8Array[] = [];
   const lostListeners = new Set<(error: MistyError) => void>();
   const errorListeners = new Set<(error: MistyError) => void>();
+  const connectionListeners = new Set<(connected: boolean) => void>();
   let resolveSynced!: () => void;
   let rejectSynced!: (error: Error) => void;
   const synced = new Promise<void>((resolve, reject) => {
@@ -130,26 +182,92 @@ function open(
   let file: FileRef | null = null;
   let format: FileFormat | null = null;
   let writer = false;
+  let fileSeen = false;
+  let fileLoaded: boolean | undefined;
+  let editable = true;
+  let hasWriter: boolean | undefined;
+  let loading = false;
+  let nextLoad: { version: number; data: ArrayBuffer } | null = null;
+  let loadFailures = 0;
+  let readyTimer: ReturnType<typeof setTimeout> | undefined;
   const fileListeners = new Set<(file: FileRef) => void>();
   const writerListeners = new Set<(writer: boolean) => void>();
-  let resolveFile!: () => void;
-  const fileKnown = new Promise<void>((resolve) => {
-    resolveFile = resolve;
+  const meta = isFile ? doc.getMap<unknown>(FILE_META) : null;
+  let readySettled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
   });
-  const ready = Promise.all([synced, fileKnown]).then(() => undefined);
   ready.catch(() => {});
+
+  const settleReady = (error?: MistyError) => {
+    if (readySettled) return;
+    readySettled = true;
+    clearTimeout(readyTimer);
+    readyTimer = undefined;
+    if (error) rejectReady(error);
+    else resolveReady();
+  };
+
+  const markedLoaded = () => meta !== null && meta.get("loaded") !== undefined;
+
+  const contentLoaded = () => fileSeen && (fileLoaded !== false || markedLoaded());
+
+  const checkReady = () => {
+    if (!isFile || readySettled || destroyed || lost || !isSynced || !fileSeen) return;
+    if (contentLoaded()) return settleReady();
+    if (!editable && !writer && hasWriter !== true) {
+      settleReady(
+        new MistyError("read_only", "Nobody who can edit this file has it open, so it can't be shown live."),
+      );
+    }
+  };
+
+  const markSynced = () => {
+    if (isSynced) return;
+    isSynced = true;
+    resolveSynced();
+    checkReady();
+    if (isFile && !readySettled && readyTimer === undefined)
+      readyTimer = setTimeout(() => {
+        readyTimer = undefined;
+        if (destroyed || lost) return;
+        settleReady(new MistyError("stalled", "The file didn't load in time. Close it and open it again."));
+      }, READY_BOUND_MS);
+  };
+
+  const report = (error: MistyError) => {
+    for (const listener of [...errorListeners]) safely(() => listener(error));
+  };
+
+  const setConnected = (next: boolean, refresh: boolean) => {
+    if (refresh) refreshAwareness();
+    if (connected === next) return;
+    connected = next;
+    for (const listener of [...connectionListeners]) safely(() => listener(next));
+  };
 
   const lose = (error: MistyError) => {
     if (destroyed || lost) return;
     lost = error;
-    rejectSynced(error);
-    for (const listener of [...lostListeners]) listener(error);
-    lostListeners.clear();
     stop();
+    release();
+    rejectSynced(error);
+    settleReady(error);
+    const listeners = [...lostListeners];
+    lostListeners.clear();
+    for (const listener of listeners) safely(() => listener(error));
   };
 
-  const report = (error: MistyError) => {
-    for (const listener of [...errorListeners]) listener(error);
+  const retryLater = () => {
+    if (destroyed || lost || retryTimer !== undefined) return;
+    retryTimer = setTimeout(() => {
+      retryTimer = undefined;
+      heal();
+    }, backoff(retries));
+    retries += 1;
   };
 
   const failed = (error: unknown) => {
@@ -157,10 +275,8 @@ function open(
     const problem = asError(error);
     if (FATAL.has(problem.code)) return lose(problem);
     report(problem);
-    if (syncs) {
-      dirty = true;
-      heal();
-    }
+    if (syncs) dirty = true;
+    retryLater();
   };
 
   const ask = (message: Uint8Array) => connection.call("room.sync", { id: wireId, message });
@@ -182,6 +298,20 @@ function open(
     });
   };
 
+  function refreshAwareness() {
+    if (destroyed || lost || !subscribed) return;
+    const state = awareness.getLocalState();
+    if (state !== null) awareness.setLocalState({ ...state });
+  }
+
+  const settled = () => {
+    retries = 0;
+    reopens = 0;
+    if (!reopening) return;
+    reopening = false;
+    setConnected(true, false);
+  };
+
   const resync = async () => {
     resyncing = true;
     dirty = false;
@@ -190,28 +320,41 @@ function open(
       syncProtocol.writeSyncStep1(encoder, doc);
       const { messages } = await ask(encoding.toUint8Array(encoder));
       for (const reply of messages) await answer(reply);
-      resolveSynced();
+      if (destroyed || lost) return;
+      markSynced();
+      settled();
     } catch (error) {
       const problem = asError(error);
-      if (FATAL.has(problem.code)) lose(problem);
-      else {
-        dirty = true;
-        report(problem);
+      if (FATAL.has(problem.code)) {
+        lose(problem);
+        return;
       }
+      dirty = true;
+      if (!destroyed && !lost) report(problem);
     } finally {
       resyncing = false;
+      if (dirty) retryLater();
     }
   };
 
-  const heal = () => {
-    if (destroyed || lost) return;
-    if (awarenessDirty && awareness.getLocalState() !== null) sendAwareness();
+  function heal() {
+    if (destroyed || lost || !subscribed) return;
+    if (retryTimer !== undefined) {
+      clearTimeout(retryTimer);
+      retryTimer = undefined;
+    }
+    if (awarenessDirty) sendAwareness();
     if (!syncs || !dirty || resyncing) return;
     void resync();
-  };
+  }
 
   const onDocUpdate = (update: Uint8Array, origin: unknown) => {
     if (origin === REMOTE || destroyed || lost) return;
+    if (!subscribed) {
+      if (syncs) dirty = true;
+      else held.push(update);
+      return;
+    }
     connection.call("room.update", { id: wireId, update }).then(heal, failed);
   };
   const onAwarenessUpdate = (
@@ -219,6 +362,10 @@ function open(
     origin: unknown,
   ) => {
     if (origin === REMOTE || destroyed || lost) return;
+    if (!subscribed) {
+      awarenessDirty = true;
+      return;
+    }
     const update = encodeAwarenessUpdate(awareness, [...added, ...updated, ...removed]);
     connection.call("room.awareness", { id: wireId, update }).catch((error: unknown) => {
       awarenessDirty = true;
@@ -227,56 +374,141 @@ function open(
   };
   doc.on("update", onDocUpdate);
   awareness.on("update", onAwarenessUpdate);
+  const onMeta = () => checkReady();
+  meta?.observe(onMeta);
 
-  const loadFile = async (version: number, data: ArrayBuffer) => {
-    if (!options.load) return;
-    const meta = doc.getMap<unknown>(FILE_META);
-    if (meta.get("loaded") !== undefined) return;
-    try {
-      await options.load(data, doc);
-      if (!destroyed && !lost) meta.set("loaded", version);
-    } catch (error) {
-      report(asError(error));
+  const loadFile = async (version: number, data: ArrayBuffer): Promise<void> => {
+    if (!meta || !options.load || destroyed || lost || markedLoaded()) return;
+    if (loading) {
+      nextLoad = { version, data };
+      return;
     }
-  };
-
-  const serializeFile = async (request: number) => {
+    if (!writer) return;
+    loading = true;
+    const scratch = new Y.Doc({ gc });
+    let bound: ReturnType<typeof setTimeout> | undefined;
     try {
-      if (!options.serialize) throw new MistyError("unsupported", "This app can't write this file.");
-      const data = await fileBytes(await options.serialize(doc));
-      await connection.call("room.serialized", { id: wireId, request, data });
+      await Promise.race([
+        Promise.resolve().then(() => options.load?.(data, scratch)),
+        new Promise<never>((_, reject) => {
+          bound = setTimeout(
+            () => reject(new MistyError("stalled", "The app took too long to load this file.")),
+            LOAD_BOUND_MS,
+          );
+        }),
+      ]);
+      if (destroyed || lost || markedLoaded() || !writer) return;
+      const update = Y.encodeStateAsUpdate(scratch);
+      doc.transact(() => {
+        Y.applyUpdate(doc, update);
+        meta.set("loaded", version);
+      }, LOADING);
+      loadFailures = 0;
     } catch (error) {
       if (destroyed || lost) return;
       const problem = asError(error);
-      if (FATAL.has(problem.code)) return lose(problem);
-      await connection
-        .call("room.serialized", { id: wireId, request, error: problem.message })
-        .catch(failed);
+      report(problem);
+      loadFailures += 1;
+      if (loadFailures >= MAX_LOAD_FAILURES) {
+        nextLoad = null;
+        settleReady(new MistyError(problem.code, `The app couldn't load this file. ${problem.message}`));
+      }
+    } finally {
+      clearTimeout(bound);
+      scratch.destroy();
+      loading = false;
+      const queued = nextLoad;
+      nextLoad = null;
+      if (queued && !readySettled) void loadFile(queued.version, queued.data);
     }
+  };
+
+  const answerSerialize = (request: number, reply: { data: Uint8Array } | { error: string }) =>
+    connection.call("room.serialized", { id: wireId, request, ...reply }).catch((error: unknown) => {
+      if (!destroyed && !lost) report(asError(error));
+    });
+
+  const serializeFile = async (request: number) => {
+    try {
+      await synced;
+    } catch {
+      return;
+    }
+    if (destroyed || lost) return;
+    if (!contentLoaded()) {
+      await answerSerialize(request, { error: "The document hasn't loaded yet, so there is nothing to save." });
+      return;
+    }
+    let data: Uint8Array;
+    try {
+      if (!options.serialize) throw new MistyError("unsupported", "This app can't write this file.");
+      data = await fileBytes(await options.serialize(doc));
+    } catch (error) {
+      if (destroyed || lost) return;
+      const problem = asError(error);
+      report(problem);
+      await answerSerialize(request, { error: problem.message });
+      return;
+    }
+    if (destroyed || lost) return;
+    await answerSerialize(request, { data });
   };
 
   const receive = (event: RoomEvent) => {
     if (destroyed || lost) return;
     switch (event.type) {
       case "sync":
-        Y.applyUpdate(doc, bytesOf(event.update), REMOTE);
-        if (!syncs) resolveSynced();
+        try {
+          Y.applyUpdate(doc, bytesOf(event.update), REMOTE);
+        } catch (error) {
+          report(asError(error));
+        }
+        if (!syncs) {
+          markSynced();
+          settled();
+        }
         heal();
         return;
       case "awareness":
-        applyAwarenessUpdate(awareness, bytesOf(event.update), REMOTE);
+        try {
+          applyAwarenessUpdate(awareness, bytesOf(event.update), REMOTE);
+        } catch (error) {
+          report(asError(error));
+        }
         return;
       case "message":
         answer(bytesOf(event.message)).then(heal, failed);
         return;
+      case "connection":
+        setConnected(event.connected, event.connected);
+        return;
+      case "problem": {
+        const problem = new MistyError(event.code, event.message);
+        report(problem);
+        if (event.code === "reloaded") lose(problem);
+        return;
+      }
       case "file": {
         file = event.file;
         format = event.format;
+        if (event.format === "app" && (!options.load || !options.serialize)) {
+          lose(
+            new MistyError(
+              "unsupported",
+              "This app can't keep this file as a live document: it needs both load and serialize.",
+            ),
+          );
+          return;
+        }
         const changed = writer !== event.writer;
         writer = event.writer;
-        resolveFile();
-        for (const listener of [...fileListeners]) listener(event.file);
-        if (changed) for (const listener of [...writerListeners]) listener(writer);
+        if (typeof event.loaded === "boolean") fileLoaded = event.loaded;
+        editable = event.editable !== false;
+        hasWriter = typeof event.has_writer === "boolean" ? event.has_writer : undefined;
+        fileSeen = true;
+        for (const listener of [...fileListeners]) safely(() => listener(event.file));
+        if (changed) for (const listener of [...writerListeners]) safely(() => listener(writer));
+        checkReady();
         return;
       }
       case "load":
@@ -295,19 +527,78 @@ function open(
 
   const params: RoomParams = { ...target, ...(gc ? {} : { gc }), ...(syncs ? { sync: true } : {}) };
   let unsubscribe: Unsubscribe | undefined;
+
+  const flushHeld = () => {
+    if (!held.length) return;
+    const update = Y.mergeUpdates(held.splice(0));
+    connection.call("room.update", { id: wireId, update }).then(heal, failed);
+  };
+
+  const reopen = () => {
+    reopenTimer = undefined;
+    if (destroyed || lost) return;
+    subscribeRoom();
+    if (!subscribed) return;
+    if (syncs) {
+      dirty = true;
+      heal();
+    } else flushHeld();
+    refreshAwareness();
+  };
+
+  const onEnd = (error?: MistyError) => {
+    if (destroyed || lost) return;
+    const problem = error ?? new MistyError("closed", "The room was closed.");
+    generation += 1;
+    subscribed = false;
+    unsubscribe = undefined;
+    if (!REOPENS.has(problem.code) || reopens >= MAX_REOPENS) return lose(problem);
+    report(problem);
+    reopening = true;
+    setConnected(false, false);
+    reopenTimer = setTimeout(reopen, backoff(reopens));
+    reopens += 1;
+  };
+
+  function subscribeRoom() {
+    const mine = ++generation;
+    subscribed = true;
+    const ended = connection.subscribe("room", params, receive, (error) => {
+      if (mine === generation) onEnd(error);
+    });
+    if (mine === generation && subscribed) unsubscribe = ended;
+    else ended();
+  }
+
+  const stopReset = connection.onReset(() => {
+    if (destroyed || lost || !subscribed) return;
+    if (syncs) dirty = true;
+    heal();
+    refreshAwareness();
+  });
+
   let stopped = false;
   function stop() {
+    if (stopped) return;
     stopped = true;
-    unsubscribe?.();
+    generation += 1;
+    subscribed = false;
+    clearTimeout(retryTimer);
+    retryTimer = undefined;
+    clearTimeout(reopenTimer);
+    reopenTimer = undefined;
+    clearTimeout(readyTimer);
+    readyTimer = undefined;
+    const end = unsubscribe;
     unsubscribe = undefined;
+    end?.();
     doc.off("update", onDocUpdate);
     awareness.off("update", onAwarenessUpdate);
+    meta?.unobserve(onMeta);
+    stopReset();
   }
-  const ended = connection.subscribe("room", params, receive, (error) =>
-    lose(error ?? new MistyError("closed", "The room was closed.")),
-  );
-  if (stopped) ended();
-  else unsubscribe = ended;
+
+  subscribeRoom();
   if (syncs) heal();
 
   const room: Room = {
@@ -317,6 +608,9 @@ function open(
     synced,
     get lost() {
       return lost;
+    },
+    get connected() {
+      return connected && !lost;
     },
     onLost(listener) {
       if (lost) {
@@ -330,6 +624,10 @@ function open(
       errorListeners.add(listener);
       return () => errorListeners.delete(listener);
     },
+    onConnection(listener) {
+      connectionListeners.add(listener);
+      return () => connectionListeners.delete(listener);
+    },
     identity(clientId) {
       if (clientId === doc.clientID) return host.me;
       return identityOf(awareness.getStates().get(clientId));
@@ -339,12 +637,16 @@ function open(
       destroyed = true;
       lostListeners.clear();
       errorListeners.clear();
+      connectionListeners.clear();
       fileListeners.clear();
       writerListeners.clear();
-      if (!lost) stop();
+      stop();
+      release();
       awareness.destroy();
       doc.destroy();
-      rejectSynced(new MistyError("cancelled", "The room was left."));
+      const left = new MistyError("cancelled", "The room was left.");
+      rejectSynced(left);
+      settleReady(left);
     },
   };
   if (!("file" in target)) return room;
@@ -356,6 +658,8 @@ function open(
     format: { get: () => format, enumerable: true },
     text: { get: () => doc.getText(FILE_TEXT), enumerable: true },
     writer: { get: () => writer, enumerable: true },
+    loaded: { get: () => isSynced && contentLoaded(), enumerable: true },
+    editable: { get: () => editable, enumerable: true },
     ready: { value: ready, enumerable: true },
     onFile: {
       value: (listener: (next: FileRef) => void): Unsubscribe => {

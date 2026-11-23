@@ -19,6 +19,7 @@ export type {
   Offers,
   RoomEvent,
   RoomParams,
+  RoomProblemCode,
   TopicName,
   Topics,
   WatchOptions,

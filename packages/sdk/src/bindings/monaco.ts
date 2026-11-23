@@ -1,8 +1,9 @@
-import type { editor as MonacoEditor } from "monaco-editor";
+import type { IDisposable, editor as MonacoEditor } from "monaco-editor";
 import { MonacoBinding } from "y-monaco";
 import * as Y from "yjs";
 import type { Room } from "../room.js";
-import { peersOf, trustIdentity } from "./identity.js";
+import { clearLocalFields, peersOf, trustIdentity } from "./identity.js";
+import { refuseCarriageReturns } from "./line_endings.js";
 
 export interface MonacoBindingHandle {
   binding: MonacoBinding;
@@ -16,17 +17,29 @@ export interface MonacoOptions {
   name?: string;
 }
 
-const STYLE_ID = "misty-monaco-peers";
+type Editor = MonacoEditor.IStandaloneCodeEditor;
+
+const STYLE_PREFIX = "misty-monaco-peers";
+
+const SELECTION_FIELD = "selection";
+
+const KEY_Y = 55;
+
+const KEY_Z = 56;
+
+const LINE_FEED = 0 as MonacoEditor.EndOfLineSequence;
+
+let nextStyle = 0;
 
 function cssString(value: string): string {
   return JSON.stringify(value.replace(/[\n\r]/g, " "));
 }
 
-function drawPeers(room: Room, doc: Document) {
-  let style = doc.getElementById(STYLE_ID);
+function drawPeers(room: Room, doc: Document, styleId: string) {
+  let style = doc.getElementById(styleId);
   if (!style) {
     style = doc.createElement("style");
-    style.id = STYLE_ID;
+    style.id = styleId;
     doc.head.appendChild(style);
   }
   style.textContent = peersOf(room)
@@ -41,39 +54,60 @@ function drawPeers(room: Room, doc: Document) {
     .join("");
 }
 
-export function bindMonaco(
-  room: Room,
-  editor: MonacoEditor.IStandaloneCodeEditor,
-  options: MonacoOptions = {},
-): MonacoBindingHandle {
+function tracked(editor: Editor, disposables: IDisposable[]): Editor {
+  return new Proxy(editor, {
+    get(target, property) {
+      if (property === "onDidChangeCursorSelection") {
+        return (...args: Parameters<Editor["onDidChangeCursorSelection"]>) => {
+          const disposable = target.onDidChangeCursorSelection(...args);
+          disposables.push(disposable);
+          return disposable;
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
+export function bindMonaco(room: Room, editor: Editor, options: MonacoOptions = {}): MonacoBindingHandle {
   const model = editor.getModel();
   if (!model) throw new Error("The editor has no model to bind.");
   const text = options.text ?? room.doc.getText(options.name ?? "text");
-  const stopIdentity = trustIdentity(room, "user");
-  const binding = new MonacoBinding(text, model, new Set([editor]), room.awareness);
+  refuseCarriageReturns(text);
+  const stopIdentity = trustIdentity(room, "user", [SELECTION_FIELD]);
+  const leaked: IDisposable[] = [];
+  const binding = new MonacoBinding(text, model, new Set([tracked(editor, leaked)]), room.awareness);
+  model.setEOL(LINE_FEED);
   const undoManager = new Y.UndoManager(text, { trackedOrigins: new Set([binding]) });
   const doc = editor.getContainerDomNode().ownerDocument;
-  const redraw = () => drawPeers(room, doc);
+  const styleId = `${STYLE_PREFIX}-${(nextStyle += 1)}`;
+  const redraw = () => drawPeers(room, doc, styleId);
   room.awareness.on("change", redraw);
   redraw();
   const keys = editor.onKeyDown((event) => {
     const mod = event.metaKey || event.ctrlKey;
-    const key = event.browserEvent.key.toLowerCase();
-    if (!mod || (key !== "z" && key !== "y")) return;
+    const keyCode: number = event.keyCode;
+    if (!mod || (keyCode !== KEY_Z && keyCode !== KEY_Y)) return;
     event.preventDefault();
     event.stopPropagation();
-    if (key === "y" || event.shiftKey) undoManager.redo();
+    if (keyCode === KEY_Y || event.shiftKey) undoManager.redo();
     else undoManager.undo();
   });
+  let destroyed = false;
   return {
     binding,
     text,
     undoManager,
     destroy() {
+      if (destroyed) return;
+      destroyed = true;
       keys.dispose();
+      for (const disposable of leaked.splice(0)) disposable.dispose();
       room.awareness.off("change", redraw);
-      doc.getElementById(STYLE_ID)?.remove();
+      doc.getElementById(styleId)?.remove();
       stopIdentity();
+      clearLocalFields(room, [SELECTION_FIELD]);
       undoManager.destroy();
       binding.destroy();
     },

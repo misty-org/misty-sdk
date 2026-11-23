@@ -3,9 +3,9 @@ import { Connection } from "./connection.js";
 import { MistyError } from "./errors.js";
 import type { Frame } from "./protocol.js";
 
-function pair() {
+function pair(timeoutMs?: number) {
   const { port1, port2 } = new MessageChannel();
-  const connection = new Connection(port1);
+  const connection = new Connection(port1, { timeoutMs });
   const received: Frame[] = [];
   port2.onmessage = (event) => received.push(event.data as Frame);
   const wait = () => new Promise((resolve) => setTimeout(resolve, 25));
@@ -65,6 +65,53 @@ describe("Connection", () => {
     await expect(call).rejects.toMatchObject({ code: "closed" });
     expect(ended[0]).toMatchObject({ code: "closed" });
     await expect(connection.call("sources.list")).rejects.toMatchObject({ code: "closed" });
+  });
+
+  it("fails a call Misty doesn't answer in time", async () => {
+    const { connection } = pair(20);
+    await expect(connection.call("members.list")).rejects.toMatchObject({ code: "internal" });
+    connection.close();
+  });
+
+  it("stops its subscriptions with Misty when it closes", async () => {
+    const { connection, received, wait } = pair();
+    connection.subscribe("theme", undefined, () => {});
+    await wait();
+    const id = (received[0] as { id: number }).id;
+    connection.close();
+    await wait();
+    expect(received[1]).toMatchObject({ t: "unsub", id });
+  });
+
+  it("moves to a new port when Misty restarts, then subscribes again and sends what waited", async () => {
+    const { connection, received, wait } = pair();
+    const seen: unknown[] = [];
+    connection.subscribe("theme", undefined, (theme) => seen.push(theme));
+    const lost = connection.call("members.list");
+    await wait();
+    const { port1, port2 } = new MessageChannel();
+    const next: Frame[] = [];
+    port2.onmessage = (event) => next.push(event.data as Frame);
+    const resets: number[] = [];
+    connection.onReset(() => resets.push(1));
+    connection.replace(port1);
+    await expect(lost).rejects.toMatchObject({ code: "internal" });
+    const waiting = connection.call("members.list");
+    const hello = connection.call("hello", { sdk: "test", protocol: 1 });
+    await wait();
+    expect(next.map((frame) => frame.t === "req" && frame.method)).toEqual(["hello"]);
+    port2.postMessage({ t: "res", id: (next[0] as { id: number }).id, ok: true, result: {} });
+    await hello;
+    connection.resume();
+    await wait();
+    expect(next.slice(1)).toMatchObject([
+      { t: "sub", topic: "theme", id: (received[0] as { id: number }).id },
+      { t: "req", method: "members.list" },
+    ]);
+    expect(resets).toEqual([1]);
+    port2.postMessage({ t: "res", id: (next[2] as { id: number }).id, ok: true, result: [] });
+    await expect(waiting).resolves.toEqual([]);
+    connection.close();
   });
 
   it("passes MCP messages both ways", async () => {

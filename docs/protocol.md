@@ -70,13 +70,28 @@ The result is the app's context:
 | `me` | `{ user_id, name, role, avatar_version?, tone? }`: the person using the app; `tone` is their avatar color |
 | `theme` | `{ mode, tokens, fonts: { sans, mono, css? } }` |
 | `route` | `{ path, params }`: the app's own address inside the Space |
-| `permissions` | What the Space's mod approved: `files`, `chat.post`, `rooms`, `members`, `calls` |
+| `permissions` | What the Space's mod approved, of `files`, `chat.post`, `rooms`, `members`, `calls`: never more than the manifest asks, and possibly less |
 | `protocol` | The version this connection speaks |
 | `versions` | Every version this Misty speaks |
 | `offers` | `{ calls: string[], topics: string[] }`: everything this Misty answers |
 
 A Misty that sends no `offers` answers the first version's calls and topics, the ones below not marked as added
 later. Before using anything newer, look it up in `offers`; a call Misty doesn't answer fails with `unsupported`.
+Besides calls and topics, `offers` may name features of a topic: `room.connection` and `room.problem` (added) say
+Misty sends the room events of those names.
+
+Treat `permissions` as a hint for what to show, not a promise: a call can still fail with `permission_denied`,
+for instance after the Space's mod changes what the app may do.
+
+## Restarts and time limits
+
+Misty may start the app's channel again (when its own side of the app restarts) by posting a new start message
+with a new port. The old port is then dead: the app moves to the new one, says `hello` again, sends `sub` again for
+every subscription it keeps, with the same ids, and then the calls that waited. Calls that were waiting on the old
+port get no answer; treat them as failed. If the new `hello` names another app, Space or person, the app closes.
+
+Misty answers every call; an app should still give up on one that takes far too long (the SDK waits a minute for
+most calls, longer for picking and moving files and for room syncs) and treat it as failed.
 
 ## Calls
 
@@ -156,7 +171,9 @@ A room is a Yjs document with awareness, kept on the Space's server.
   id shares it.
 - `{ file }` opens a Space file as a live document (added), described below. Its room id in calls is
   `file/<file id>`, which no app room id can be.
-- `gc: false` keeps deleted content, on both sides.
+- `gc: false` keeps deleted content in the app's document and in Misty's copy of the room. A Space's server that
+  doesn't keep deleted content yet still collects it in its own copy.
+- An app opens a room id once at a time on its port.
 
 Room events:
 
@@ -165,12 +182,27 @@ Room events:
 | `{ type: "sync", update }` | A Yjs update to apply. Without `sync`, the first one is the whole document |
 | `{ type: "awareness", update }` | A y-protocols awareness update to apply |
 | `{ type: "message", message }` (added) | A y-protocols sync message: answer it with `room.sync` |
-| `{ type: "file", file, format, writer }` (added) | The file, its format, and whether this copy writes it |
+| `{ type: "file", file, format, writer, loaded?, editable?, has_writer? }` (added) | The file, its format, whether this copy writes it, whether its content is in the room, whether this person can edit it and whether anyone in the room can load it |
+| `{ type: "connection", connected }` (added) | Misty's link to the server for this room went down, or came back and is in step |
+| `{ type: "problem", code, message }` (added) | Something the app should know: a code below and a sentence for a person |
 | `{ type: "load", request, version, data }` (added) | Fill the empty room from the file's bytes |
 | `{ type: "serialize", request }` (added) | Turn the room into the file's bytes and answer with `room.serialized` |
 
 The app sends its own document changes with `room.update` (a Yjs update) and its awareness with
 `room.awareness`.
+
+A `problem`'s `code` is one of `too_large` (the room reached the server's size limit; edits are not being saved),
+`too_large_warning` (close to it), `stalled` (the room hasn't come into step within Misty's bound; still trying),
+`read_only` (this person can't edit here), `save_failed` (a file room's save failed) and `reloaded` (the room was
+replaced on the server: drop the document and open the room again, rather than send the old content into the new
+room). Ignore codes you don't know.
+
+Awareness lasts as long as the connection: don't time out others' states, and don't renew your own on a timer.
+After `connection` comes back with `connected: true`, send your own state again with a higher clock, since the
+server dropped it while the link was down.
+
+An `end` with code `internal` is a passing failure: open the room again with a new `sub` after a pause, keeping the
+document, and run the steps under "Staying in step" again. Any other code is final.
 
 ### Staying in step
 
@@ -190,8 +222,9 @@ Without `sync`, Misty sends the whole document as the first `sync` event, as in 
 
 Misty owns the awareness field `misty`: `{ user_id, name, tone }`, the person behind each awareness state and
 their avatar color. Misty writes it into every state the app sends and the server refuses a state that names
-anyone else, so it can't be faked. The app's own fields (a cursor, a selection) are its own. An app can only
-send states for its own awareness clients.
+anyone else, so it can't be faked. The app's own fields (a cursor, a selection, a `user` label) are whatever each
+copy of the app wrote: draw a person's name only from `misty`, and draw no one for a state without it. An app can
+only send states for its own awareness clients.
 
 ### Files as live documents
 
@@ -205,11 +238,25 @@ and keeping the document, and the app only turns it into bytes.
   when it closes. There is no timer and no election among apps. The `file` event's `writer` says whether this
   copy holds it, and is sent again when that changes.
 - When the room is new and this copy writes, Misty fills it: for `text` it puts the file's text in, for `app` it
-  sends `load` with the file's bytes. The app fills the document, then sets `loaded` in the map `misty:file` to
-  the event's `version`. A room with `loaded` set is never loaded again.
+  sends `load` with the file's bytes. The app fills the document and sets `loaded` in the map `misty:file` to
+  the event's `version`, in one Yjs transaction, so a room is never seen half loaded. A room with `loaded` set is
+  never loaded again; an app that gets a second `load` while it is still loading ignores it.
+- The `file` event's `loaded` says whether the room holds the file's content, and `editable` whether this person
+  can edit it; Misty sends `file` again when either changes. A Misty that sends neither means `true` for both once
+  the room is in step. When `loaded`, `editable` and `writer` are all `false`, nobody who can edit the file has it
+  open, and its content can't be shown live. A Misty that sends `has_writer: true` with them has an editor in the
+  room still loading the file, so wait for `loaded`; once `has_writer` is `false`, nobody is.
+- Misty may ask for `serialize` once more when the room was replaced on the server while this copy held changes
+  that never reached it. It keeps those bytes beside the file as a conflicted copy, then ends the room with the
+  `reloaded` problem, whose message names the copy.
+- When the file changed somewhere else while the room held unsaved changes, Misty keeps the room's content beside
+  the file as a conflicted copy before the room is replaced. For that moment the server takes no document changes
+  from anyone: Misty holds the app's `room.update`s, says so with a `stalled` problem, and sends them on once the
+  server takes changes again, or keeps them in the copy when the room is replaced. The app needs to do nothing.
 - When the room has changed, Misty asks the writing copy to `serialize`. The app answers
   `room.serialized { id, request, data }` with the file's bytes, or `{ id, request, error }`, and Misty saves the
-  file. Nothing unsaved is lost in the meantime: it lives in the room on the server until a writer saves it.
+  file. Nothing unsaved is lost in the meantime: it lives in the room on the server until a writer saves it. Answer
+  only once the room is in step and loaded; a failed `room.serialized` call doesn't end the room.
 - The file is marked in use by this person while the room is open.
 
 ## The MCP stream

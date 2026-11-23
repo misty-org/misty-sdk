@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import type { Unsubscribe } from "../connection.js";
 import type { Room } from "../room.js";
-import { peersOf, type Peer } from "./identity.js";
+import { clearLocalFields, peersOf, type Peer } from "./identity.js";
 
 export type { Peer } from "./identity.js";
 export { colorsOf, peersOf, TONE_COLORS, TONE_INK } from "./identity.js";
@@ -45,6 +45,9 @@ export interface Store<T> {
 
 const PRESENCE_FIELD = "presence";
 
+const copy = <V>(value: V): V =>
+  typeof value === "object" && value !== null && !(value instanceof Y.AbstractType) ? structuredClone(value) : value;
+
 export function bindStore<T = unknown>(room: Room, options: StoreOptions = {}): Store<T> {
   const map = room.doc.getMap<T>(options.name ?? "store");
   const origin = { store: options.name ?? "store" };
@@ -56,8 +59,10 @@ export function bindStore<T = unknown>(room: Room, options: StoreOptions = {}): 
   const historyListeners = new Set<() => void>();
   const peerListeners = new Set<(peers: Peer[]) => void>();
   let destroyed = false;
+  let historyChanged = false;
 
   const observe = (event: Y.YMapEvent<T>, transaction: Y.Transaction) => {
+    if (transaction.origin === undoManager) historyChanged = true;
     const changed: string[] = [];
     const removed: string[] = [];
     for (const [key, change] of event.changes.keys) (change.action === "delete" ? removed : changed).push(key);
@@ -81,21 +86,29 @@ export function bindStore<T = unknown>(room: Room, options: StoreOptions = {}): 
     if (!destroyed) room.doc.transact(work, origin);
   };
 
+  const step = (run: () => unknown): boolean => {
+    if (destroyed) return false;
+    historyChanged = false;
+    const item = run();
+    return item !== null && historyChanged;
+  };
+
   return {
     map,
     undoManager,
     origin,
-    get: (key) => map.get(key),
+    get: (key) => copy(map.get(key)),
     has: (key) => map.has(key),
     keys: () => [...map.keys()],
-    entries: () => [...map.entries()],
-    toObject: () => Object.fromEntries(map.entries()) as Record<string, T>,
+    entries: () => [...map.entries()].map(([key, value]): [string, T] => [key, copy(value)]),
+    toObject: () => Object.fromEntries([...map.entries()].map(([key, value]) => [key, copy(value)])) as Record<string, T>,
     get size() {
       return map.size;
     },
     set: (key, value) => write(() => map.set(key, value)),
     update: (key, patch) =>
       write(() => {
+        if (!map.has(key)) return;
         const current = map.get(key);
         map.set(key, { ...(current as object), ...(patch as object) } as T);
       }),
@@ -105,8 +118,8 @@ export function bindStore<T = unknown>(room: Room, options: StoreOptions = {}): 
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    undo: () => undoManager.undo() !== null,
-    redo: () => undoManager.redo() !== null,
+    undo: () => step(() => undoManager.undo()),
+    redo: () => step(() => undoManager.redo()),
     canUndo: () => undoManager.canUndo(),
     canRedo: () => undoManager.canRedo(),
     onHistory(listener) {
@@ -125,6 +138,7 @@ export function bindStore<T = unknown>(room: Room, options: StoreOptions = {}): 
       destroyed = true;
       map.unobserve(observe);
       room.awareness.off("change", peersChanged);
+      clearLocalFields(room, [PRESENCE_FIELD]);
       undoManager.destroy();
       listeners.clear();
       historyListeners.clear();

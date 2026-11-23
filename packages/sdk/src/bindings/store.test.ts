@@ -14,8 +14,10 @@ function fakeRoom(): Room {
     awareness,
     synced: Promise.resolve(),
     lost: null,
+    connected: true,
     onLost: () => () => {},
     onError: () => () => {},
+    onConnection: () => () => {},
     identity: (clientId) => {
       if (clientId === doc.clientID) return { user_id: "ana", name: "Ana", tone: "blue" };
       const state = awareness.getStates().get(clientId) as { misty?: { user_id: string; name: string } } | undefined;
@@ -46,6 +48,33 @@ describe("bindStore", () => {
   });
 });
 
+describe("bindStore, with others writing", () => {
+  it("never brings back a value someone deleted, and hands out copies", () => {
+    const room = fakeRoom();
+    const store = bindStore<{ x: number; y?: number }>(room, { name: "cells", captureTimeout: 0 });
+    store.set("a", { x: 1 });
+    room.doc.transact(() => room.doc.getMap("cells").delete("a"), "someone-else");
+    store.update("a", { y: 2 });
+    expect(store.has("a")).toBe(false);
+    store.set("b", { x: 1 });
+    const copy = store.get("b")!;
+    copy.x = 5;
+    expect(store.get("b")).toEqual({ x: 1 });
+    store.destroy();
+  });
+
+  it("says when undo had nothing to take back", () => {
+    const room = fakeRoom();
+    const store = bindStore<{ x: number }>(room, { name: "cells", captureTimeout: 0 });
+    expect(store.undo()).toBe(false);
+    store.set("a", { x: 1 });
+    expect(store.undo()).toBe(true);
+    expect(store.redo()).toBe(true);
+    store.destroy();
+    expect(room.awareness.getLocalState()?.presence).toBeNull();
+  });
+});
+
 describe("trustIdentity", () => {
   it("draws every remote person by Misty's identity, whatever their own field says", () => {
     const room = fakeRoom();
@@ -54,6 +83,18 @@ describe("trustIdentity", () => {
     room.awareness.states.set(7, { misty: { user_id: "sam", name: "Sam" }, user: { name: "Not Sam" } });
     room.awareness.emit("change", [{ added: [7], updated: [], removed: [] }, "remote"]);
     expect(room.awareness.getStates().get(7)).toMatchObject({ user: { name: "Sam", color: "#eab7ab" } });
+    stop();
+    expect(room.awareness.getLocalState()?.user).toBeNull();
+  });
+
+  it("draws nobody Misty hasn't vouched for", () => {
+    const room = fakeRoom();
+    const stop = trustIdentity(room, "user", ["cursor"]);
+    room.awareness.states.set(8, { user: { name: "Sam" }, cursor: { anchor: 1, head: 1 } });
+    room.awareness.emit("change", [{ added: [8], updated: [], removed: [] }, "remote"]);
+    const state = room.awareness.getStates().get(8);
+    expect(state?.user).toBeUndefined();
+    expect(state?.cursor).toBeUndefined();
     stop();
   });
 });

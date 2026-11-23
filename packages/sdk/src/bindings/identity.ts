@@ -40,23 +40,50 @@ export function peersOf(room: Room): Peer[] {
   return peers;
 }
 
-export function trustIdentity(room: Room, field: string): () => void {
+const holds = new WeakMap<object, Map<string, number>>();
+
+function hold(awareness: object, field: string, change: 1 | -1): number {
+  const counts = holds.get(awareness) ?? new Map<string, number>();
+  holds.set(awareness, counts);
+  const next = Math.max(0, (counts.get(field) ?? 0) + change);
+  if (next) counts.set(field, next);
+  else counts.delete(field);
+  return next;
+}
+
+export function trustIdentity(room: Room, field: string, cursorFields: readonly string[] = []): () => void {
   const me = room.identity(room.doc.clientID);
   room.awareness.setLocalStateField(field, editorUser(me));
+  hold(room.awareness, field, 1);
   const rewrite = ({ added, updated }: { added: number[]; updated: number[] }) => {
     const states = room.awareness.getStates();
     for (const clientId of [...added, ...updated]) {
       if (clientId === room.doc.clientID) continue;
       const state = states.get(clientId) as Record<string, unknown> | undefined;
+      if (!state) continue;
       const who = room.identity(clientId);
-      if (state && who) state[field] = editorUser(who);
+      if (who) {
+        state[field] = editorUser(who);
+        continue;
+      }
+      delete state[field];
+      for (const cursor of cursorFields) delete state[cursor];
     }
   };
   room.awareness.on("change", rewrite);
   room.awareness.on("update", rewrite);
   rewrite({ added: [...room.awareness.getStates().keys()], updated: [] });
+  let stopped = false;
   return () => {
+    if (stopped) return;
+    stopped = true;
     room.awareness.off("change", rewrite);
     room.awareness.off("update", rewrite);
+    if (hold(room.awareness, field, -1) === 0) room.awareness.setLocalStateField(field, null);
   };
+}
+
+export function clearLocalFields(room: Room, fields: readonly string[]): void {
+  if (room.awareness.getLocalState() === null) return;
+  for (const field of fields) room.awareness.setLocalStateField(field, null);
 }

@@ -51,7 +51,16 @@ export type ErrorCode =
   | "unsupported"
   | "cancelled"
   | "closed"
-  | "internal";
+  | "internal"
+  | RoomProblemCode;
+
+export type RoomProblemCode =
+  | "too_large"
+  | "too_large_warning"
+  | "stalled"
+  | "read_only"
+  | "save_failed"
+  | "reloaded";
 
 export interface WireError {
   code: ErrorCode;
@@ -106,7 +115,17 @@ export type RoomEvent =
   | { type: "sync"; update: Uint8Array }
   | { type: "awareness"; update: Uint8Array }
   | { type: "message"; message: Uint8Array }
-  | { type: "file"; file: FileRef; format: FileFormat; writer: boolean }
+  | {
+      type: "file";
+      file: FileRef;
+      format: FileFormat;
+      writer: boolean;
+      loaded?: boolean;
+      editable?: boolean;
+      has_writer?: boolean;
+    }
+  | { type: "connection"; connected: boolean }
+  | { type: "problem"; code: RoomProblemCode; message: string }
   | { type: "load"; request: number; version: number; data: ArrayBuffer }
   | { type: "serialize"; request: number };
 

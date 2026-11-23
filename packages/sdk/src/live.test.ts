@@ -44,6 +44,25 @@ describe("live", () => {
   });
 });
 
+describe("live, answered while starting", () => {
+  it("hands over the first value and still stops its source when the last listener leaves", () => {
+    const started: string[] = [];
+    const value = live<number>((set) => {
+      started.push("start");
+      set(1);
+      return () => started.push("stop");
+    });
+    const seen: unknown[] = [];
+    const leave = value.subscribe((state) => seen.push(state.value));
+    expect(seen).toEqual([1, 1]);
+    leave();
+    expect(started).toEqual(["start", "stop"]);
+    const again = value.subscribe(() => {});
+    again();
+    expect(started).toEqual(["start", "stop", "start", "stop"]);
+  });
+});
+
 describe("pickProtocol", () => {
   it("takes the highest version both sides speak, and a start message with only `version`", () => {
     expect(pickProtocol({ version: 1, versions: [1, 2, 3] })).toBe(1);
