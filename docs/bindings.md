@@ -168,8 +168,9 @@ shapes.onPeers((peers) => {
 ## With no build step
 
 `@misty/sdk/misty-sdk.js` (`dist/misty-sdk.js`) is one script that sets `window.MistySDK`: everything the package
-exports, `MistySDK.Y` (Yjs, bundled, so make every Yjs type from it), `MistySDK.bindStore`, `MistySDK.peersOf` and
-`MistySDK.colorsOf`. It is for pages without a bundler and for the adapters Misty's registry reviews. It carries
+exports, `MistySDK.Y` (Yjs, bundled, so make every Yjs type from it), `MistySDK.bindStore`, `MistySDK.peersOf`,
+`MistySDK.colorsOf`, `MistySDK.openDocument`, `MistySDK.joinAsAgent` and `MistySDK.agentOfCall`, and
+`MistySDK.bindMonacoModel`. It is for pages without a bundler and for the adapters Misty's registry reviews. It carries
 its own copy of Yjs, so a page that uses it makes every Yjs type from `MistySDK.Y` and loads no other Yjs.
 
 ```html
@@ -182,3 +183,10 @@ its own copy of Yjs, so a page that uses it makes every Yjs type from `MistySDK.
   });
 </script>
 ```
+
+### Monaco from a page
+
+The script can't carry `/monaco`, which imports Monaco itself. `bindMonacoModel(room, { editor, model, monaco },
+{ text? })` binds a Monaco model the page already has to a room's text, given the page's own `editor`, `model` and
+`monaco` objects: everyone's edits live, each person's cursor and selection drawn in their color (and each agent's,
+from its presence's `selection`), and remote edits applied outside the person's undo.

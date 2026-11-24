@@ -84,9 +84,45 @@ export interface HelloResult extends AppContext {
   offers?: Offers;
 }
 
+export interface RoomParamOptions {
+  key?: string;
+  text?: string | null;
+  history?: boolean;
+}
+
 export type RoomParams =
-  | { id: string; gc?: boolean; sync?: boolean }
-  | { file: string; gc?: boolean; sync?: boolean };
+  | { id: string; gc?: boolean; sync?: boolean; options?: RoomParamOptions }
+  | { file: string; gc?: boolean; sync?: boolean; options?: RoomParamOptions };
+
+export interface RoomWireOptions {
+  file?: string;
+  text?: string | null;
+  history?: boolean;
+  gc?: boolean;
+}
+
+export interface RoomPerson {
+  kind: "person" | "integration";
+  id: string;
+  name: string;
+}
+
+export interface RoomOpened {
+  type?: "opened";
+  room: string;
+  role: "edit" | "view";
+  options: RoomWireOptions;
+  seats: number;
+  max_bytes: number;
+  identity: RoomPerson;
+  conn?: string;
+}
+
+export type FrameEvent =
+  | { type: "opened"; conn: string; opened: RoomOpened }
+  | { type: "binary"; frame: Uint8Array }
+  | { type: "text"; message: Record<string, unknown> }
+  | { type: "closed"; code: number; reason: string };
 
 export interface Methods {
   hello: [Hello, HelloResult];
@@ -106,6 +142,10 @@ export interface Methods {
   "room.awareness": [{ id: string; update: Uint8Array }, void];
   "room.sync": [{ id: string; message: Uint8Array }, { messages: Uint8Array[] }];
   "room.serialized": [{ id: string; request: number; data?: Uint8Array; error?: string }, void];
+  "room.option": [{ id: string; message: Record<string, unknown> }, void];
+  "room.frame": [{ conn: string; frame?: Uint8Array; message?: Record<string, unknown> }, void];
+  "room.read": [{ key: string; as?: "update" | "json" }, { update?: Uint8Array; json?: Record<string, unknown> } | null];
+  "room.change": [{ key: string; update: Uint8Array; options?: RoomWireOptions }, void];
   "calls.join": [{ channel_id: string }, void];
   "calls.leave": [void, void];
   "calls.mute": [{ muted: boolean }, void];
@@ -127,7 +167,8 @@ export type RoomEvent =
   | { type: "connection"; connected: boolean }
   | { type: "problem"; code: RoomProblemCode; message: string }
   | { type: "load"; request: number; version: number; data: ArrayBuffer }
-  | { type: "serialize"; request: number };
+  | { type: "serialize"; request: number }
+  | { type: "option"; message: Record<string, unknown> };
 
 export interface WatchOptions {
   folder?: string;
@@ -141,6 +182,7 @@ export interface Topics {
   "members.presence": [void, Presence[]];
   "files.watch": [WatchOptions | void, FileChange];
   room: [RoomParams, RoomEvent];
+  "room.frames": [{ key: string; options?: RoomWireOptions }, FrameEvent];
   "calls.channels": [void, VoiceChannel[]];
   "calls.current": [void, CallState];
   "agents.control": [void, AgentControl];
@@ -172,6 +214,8 @@ export const FIRST_OFFERS: Offers = {
   ],
   topics: ["theme", "route", "members.presence", "files.watch", "room", "calls.channels", "calls.current"],
 };
+
+export const ROOM_OPTIONS_FEATURE = "room.options";
 
 export const isFrame = (value: unknown): value is Frame =>
   typeof value === "object" && value !== null && typeof (value as { t?: unknown }).t === "string";

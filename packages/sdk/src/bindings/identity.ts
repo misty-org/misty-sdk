@@ -1,3 +1,4 @@
+import { localAgentIdentity } from "../agents.js";
 import type { Room } from "../room.js";
 import type { AvatarTone, Identity } from "../types.js";
 
@@ -29,11 +30,15 @@ export function editorUser(identity: Identity | null): { name: string; color: st
   return { name: identity?.name || "Someone", ...colorsOf(identity?.tone ?? null) };
 }
 
+export function identityIn(room: Room, clientId: number): Identity | null {
+  return localAgentIdentity(room, clientId) ?? room.identity(clientId);
+}
+
 export function peersOf(room: Room): Peer[] {
   const peers: Peer[] = [];
   for (const [clientId, raw] of room.awareness.getStates()) {
     if (clientId === room.doc.clientID) continue;
-    const who = room.identity(clientId);
+    const who = identityIn(room, clientId);
     if (!who) continue;
     peers.push({ clientId, ...who, ...colorsOf(who.tone), state: (raw ?? {}) as Record<string, unknown> });
   }
@@ -61,7 +66,7 @@ export function trustIdentity(room: Room, field: string, cursorFields: readonly 
       if (clientId === room.doc.clientID) continue;
       const state = states.get(clientId) as Record<string, unknown> | undefined;
       if (!state) continue;
-      const who = room.identity(clientId);
+      const who = identityIn(room, clientId);
       if (who) {
         state[field] = editorUser(who);
         continue;

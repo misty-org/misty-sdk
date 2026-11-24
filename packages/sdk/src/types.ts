@@ -38,10 +38,16 @@ export interface Presence {
   app_id?: string;
 }
 
+export interface AgentCaller {
+  id: string;
+  name: string;
+}
+
 export interface Identity {
   user_id: string;
   name: string;
   tone: AvatarTone | null;
+  agent?: AgentCaller;
 }
 
 export interface AgentControl {

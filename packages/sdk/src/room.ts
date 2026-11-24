@@ -3,12 +3,14 @@ import * as encoding from "lib0/encoding";
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as syncProtocol from "y-protocols/sync";
 import * as Y from "yjs";
-import type { Connection, Unsubscribe } from "./connection.js";
+import { Connection, type Unsubscribe } from "./connection.js";
 import { MistyError, safely } from "./errors.js";
-import type { RoomEvent, RoomParams } from "./protocol.js";
-import type { AvatarTone, FileFormat, FileRef, Identity } from "./types.js";
+import { historyOver, type RoomHistory } from "./history.js";
+import type { Methods, RoomEvent, RoomParamOptions, RoomParams } from "./protocol.js";
+import { IDENTITY_FIELD, identityOf, stopOutdatedCheck } from "./room_client.js";
+import type { FileFormat, FileRef, Identity } from "./types.js";
 
-export const IDENTITY_FIELD = "misty";
+export { IDENTITY_FIELD };
 
 export const FILE_META = "misty:file";
 
@@ -16,6 +18,38 @@ export const FILE_TEXT = "text";
 
 export interface RoomOptions {
   gc?: boolean;
+  history?: boolean;
+  file?: string;
+  text?: string | null;
+}
+
+type RoomMethod = "room.update" | "room.awareness" | "room.sync" | "room.serialized" | "room.option";
+
+export interface RoomLink {
+  call<M extends RoomMethod>(method: M, params: Methods[M][0]): Promise<Methods[M][1]>;
+  subscribe(
+    topic: "room",
+    params: RoomParams,
+    listener: (event: RoomEvent) => void,
+    onEnd: (error?: MistyError) => void,
+  ): Unsubscribe;
+  onReset(listener: () => void): Unsubscribe;
+}
+
+const links = new WeakMap<Connection, RoomLink>();
+
+export function linkOf(connection: Connection | RoomLink): RoomLink {
+  if (!(connection instanceof Connection)) return connection;
+  const known = links.get(connection);
+  if (known) return known;
+  const made: RoomLink = {
+    call: (method, params) =>
+      (connection.call.bind(connection) as (name: string, value: unknown) => Promise<never>)(method, params),
+    subscribe: (topic, params, listener, onEnd) => connection.subscribe(topic, params, listener, onEnd),
+    onReset: (listener) => connection.onReset(listener),
+  };
+  links.set(connection, made);
+  return made;
 }
 
 export interface Room {
@@ -28,13 +62,14 @@ export interface Room {
   onLost(listener: (error: MistyError) => void): Unsubscribe;
   onError(listener: (error: MistyError) => void): Unsubscribe;
   onConnection(listener: (connected: boolean) => void): Unsubscribe;
+  readonly history: RoomHistory;
   identity(clientId: number): Identity | null;
   destroy(): void;
 }
 
 export type FileData = Uint8Array | ArrayBuffer | Blob | string;
 
-export interface FileRoomOptions extends RoomOptions {
+export interface FileRoomOptions extends Omit<RoomOptions, "file"> {
   load?(data: ArrayBuffer, doc: Y.Doc): void | Promise<void>;
   serialize?(doc: Y.Doc): FileData | Promise<FileData>;
 }
@@ -55,13 +90,13 @@ export interface FileRoom extends Room {
 export interface RoomHost {
   syncs: boolean;
   me: Identity;
+  options?: boolean;
+  option?: boolean;
 }
 
 const REMOTE = Symbol("misty-room-remote");
 
 const LOADING = Symbol("misty-room-load");
-
-const TONES: ReadonlySet<string> = new Set(["red", "orange", "yellow", "green", "blue", "purple", "gray"]);
 
 const FATAL: ReadonlySet<string> = new Set(["closed", "not_found", "permission_denied", "cancelled"]);
 
@@ -84,20 +119,11 @@ const backoff = (attempt: number): number => {
   return ceiling / 2 + Math.random() * (ceiling / 2);
 };
 
-const openIds = new WeakMap<Connection, Set<string>>();
+const openIds = new WeakMap<RoomLink, Set<string>>();
 
-function identityOf(state: unknown): Identity | null {
-  if (typeof state !== "object" || state === null) return null;
-  const found = (state as Record<string, unknown>)[IDENTITY_FIELD];
-  if (typeof found !== "object" || found === null) return null;
-  const { user_id: userId, name, tone } = found as Record<string, unknown>;
-  if (typeof userId !== "string" || !userId) return null;
-  return {
-    user_id: userId,
-    name: typeof name === "string" ? name : "",
-    tone: typeof tone === "string" && TONES.has(tone) ? (tone as AvatarTone) : null,
-  };
-}
+const writes = new WeakMap<Room, () => Promise<void>>();
+
+export const settledWrites = (room: Room): Promise<void> => writes.get(room)?.() ?? Promise.resolve();
 
 const bytesOf = (value: unknown): Uint8Array => {
   if (value instanceof Uint8Array) return value;
@@ -115,25 +141,40 @@ async function fileBytes(data: FileData): Promise<Uint8Array> {
 const asError = (error: unknown): MistyError =>
   error instanceof MistyError ? error : new MistyError("internal", error instanceof Error ? error.message : String(error));
 
-function stopOutdatedCheck(awareness: Awareness): void {
-  clearInterval((awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> })._checkInterval);
-}
-
-export function openRoom(connection: Connection, id: string, options: RoomOptions, host: RoomHost): Room {
-  return open(connection, { id }, id, options, host);
+export function openRoom(connection: Connection | RoomLink, id: string, options: RoomOptions, host: RoomHost): Room {
+  return open(linkOf(connection), { id }, id, options, host);
 }
 
 export function openFileRoom(
-  connection: Connection,
+  connection: Connection | RoomLink,
   fileId: string,
-  options: FileRoomOptions,
+  options: FileRoomOptions & { key?: string },
   host: RoomHost,
 ): FileRoom {
-  return open(connection, { file: fileId }, `file/${fileId}`, options, host) as FileRoom;
+  return open(linkOf(connection), { file: fileId }, `file/${fileId}`, options, host) as FileRoom;
+}
+
+function paramOptions(target: { id: string } | { file: string }, options: FileRoomOptions & { key?: string }, host: RoomHost) {
+  const wanted: RoomParamOptions = {
+    ...(options.history === undefined ? {} : { history: options.history }),
+    ...("file" in target && options.key !== undefined && options.key !== target.file ? { key: options.key } : {}),
+    ...("file" in target && options.text !== undefined
+      ? { text: options.text }
+      : "file" in target && options.load && options.serialize
+        ? { text: null }
+        : {}),
+  };
+  if (Object.keys(wanted).length === 0) return undefined;
+  if (!host.options) {
+    if (wanted.history || wanted.key !== undefined || (wanted.text !== undefined && wanted.text !== FILE_TEXT && options.text !== undefined))
+      throw new MistyError("unsupported", "This version of Misty can't open a room with these options.");
+    return undefined;
+  }
+  return wanted;
 }
 
 function open(
-  connection: Connection,
+  connection: RoomLink,
   target: { id: string } | { file: string },
   wireId: string,
   options: FileRoomOptions,
@@ -149,6 +190,14 @@ function open(
 
   const isFile = "file" in target;
   const gc = options.gc ?? true;
+  let wanted: RoomParamOptions | undefined;
+  try {
+    wanted = paramOptions(target, options, host);
+  } catch (error) {
+    taken.delete(wireId);
+    throw error;
+  }
+  const textName = typeof options.text === "string" ? options.text : FILE_TEXT;
   const doc = new Y.Doc({ gc });
   const awareness = new Awareness(doc);
   stopOutdatedCheck(awareness);
@@ -191,6 +240,15 @@ function open(
   let loadFailures = 0;
   let readyTimer: ReturnType<typeof setTimeout> | undefined;
   const fileListeners = new Set<(file: FileRef) => void>();
+  const optionListeners = new Set<(message: Record<string, unknown>) => void>();
+  let pendingWrites: Promise<unknown> = Promise.resolve();
+  const track = <T>(call: Promise<T>): Promise<T> => {
+    pendingWrites = pendingWrites.then(
+      () => call.catch(() => undefined),
+      () => call.catch(() => undefined),
+    );
+    return call;
+  };
   const writerListeners = new Set<(writer: boolean) => void>();
   const meta = isFile ? doc.getMap<unknown>(FILE_META) : null;
   let readySettled = false;
@@ -355,7 +413,7 @@ function open(
       else held.push(update);
       return;
     }
-    connection.call("room.update", { id: wireId, update }).then(heal, failed);
+    track(connection.call("room.update", { id: wireId, update })).then(heal, failed);
   };
   const onAwarenessUpdate = (
     { added, updated, removed }: { added: number[]; updated: number[]; removed: number[] },
@@ -520,18 +578,26 @@ function open(
       case "serialize":
         void serializeFile(event.request);
         return;
+      case "option":
+        for (const listener of [...optionListeners]) safely(() => listener(event.message));
+        return;
       default:
         return;
     }
   };
 
-  const params: RoomParams = { ...target, ...(gc ? {} : { gc }), ...(syncs ? { sync: true } : {}) };
+  const params: RoomParams = {
+    ...target,
+    ...(gc ? {} : { gc }),
+    ...(syncs ? { sync: true } : {}),
+    ...(wanted ? { options: wanted } : {}),
+  };
   let unsubscribe: Unsubscribe | undefined;
 
   const flushHeld = () => {
     if (!held.length) return;
     const update = Y.mergeUpdates(held.splice(0));
-    connection.call("room.update", { id: wireId, update }).then(heal, failed);
+    track(connection.call("room.update", { id: wireId, update })).then(heal, failed);
   };
 
   const reopen = () => {
@@ -601,6 +667,28 @@ function open(
   subscribeRoom();
   if (syncs) heal();
 
+  const history = historyOver({
+    send: (message) =>
+      host.option
+        ? connection.call("room.option", { id: wireId, message: { option: "history", ...message } })
+        : Promise.reject(new MistyError("unsupported", "This version of Misty can't read a room's history.")),
+    onMessage: (listener) => {
+      const each = (message: Record<string, unknown>) => {
+        if (message.option === "history") listener(message);
+      };
+      optionListeners.add(each);
+      return () => optionListeners.delete(each);
+    },
+    onDown: (listener) => {
+      const each = (up: boolean) => {
+        if (!up) listener();
+      };
+      connectionListeners.add(each);
+      return () => connectionListeners.delete(each);
+    },
+    available: () => (options.history === true ? undefined : false),
+  });
+
   const room: Room = {
     id: "file" in target ? target.file : target.id,
     doc,
@@ -628,6 +716,7 @@ function open(
       connectionListeners.add(listener);
       return () => connectionListeners.delete(listener);
     },
+    history,
     identity(clientId) {
       if (clientId === doc.clientID) return host.me;
       return identityOf(awareness.getStates().get(clientId));
@@ -640,6 +729,7 @@ function open(
       connectionListeners.clear();
       fileListeners.clear();
       writerListeners.clear();
+      optionListeners.clear();
       stop();
       release();
       awareness.destroy();
@@ -649,6 +739,12 @@ function open(
       settleReady(left);
     },
   };
+  writes.set(room, async () => {
+    for (let seen: Promise<unknown> | null = null; seen !== pendingWrites; ) {
+      seen = pendingWrites;
+      await seen;
+    }
+  });
   if (!("file" in target)) return room;
 
   const fileRoom = room as FileRoom;
@@ -656,7 +752,7 @@ function open(
     fileId: { value: target.file, enumerable: true },
     file: { get: () => file, enumerable: true },
     format: { get: () => format, enumerable: true },
-    text: { get: () => doc.getText(FILE_TEXT), enumerable: true },
+    text: { get: () => doc.getText(textName), enumerable: true },
     writer: { get: () => writer, enumerable: true },
     loaded: { get: () => isSynced && contentLoaded(), enumerable: true },
     editable: { get: () => editable, enumerable: true },

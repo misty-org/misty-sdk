@@ -33,6 +33,48 @@ back on a fresh load.
 
 Each person works on their own copy and the changes merge. Nothing of one person's screen goes to another.
 
+## Keys and options
+
+`room(key, options)` is the one way to open a room; `room(key)` is the same call with no options. The key is the
+app's own name for the room. Inside Misty, Misty keeps each app's keys apart; connected straight to a server
+(see [Outside Misty](outside-misty.md)), the key is sent as given.
+
+| Option | What it does |
+| --- | --- |
+| `gc` | `false` keeps deleted content |
+| `history` | `true` keeps versions of the room, thinned over time, which `room.history` lists, reads and restores |
+| `file` | binds the room to a Space file (below); `room.forFile(fileId, options)` is a short way to write `room(fileId, { file: fileId, ...options })` |
+| `text` | with `file`: the name of the `Y.Text` the server saves into the file (`"text"`), or `null` when the app saves the whole document itself |
+
+Whoever opens a room first fixes its options. Leaving an option out takes the room's; naming a different value
+loses the room with code `conflict`.
+
+## History
+
+```ts
+const board = misty.room("board", { history: true });
+const versions = await board.history.list(); // [{ id, at, size, by }]
+const then = await board.history.read(versions[1].id); // a Y.Doc of that version
+await board.history.restore(versions[1].id); // needs edit access; the restore arrives as ordinary sync
+```
+
+On a room opened without `history`, the calls reject with `unsupported`. Inside Misty, history needs a Misty that
+offers it (`misty.supports("room.option")`).
+
+## Reading and changing without joining
+
+`read` and `change` reach a room once, without staying in it: for a script, a bot or a webhook.
+
+```ts
+const doc = await misty.read("board"); // a Y.Doc of the room's content, or null for a room never opened
+const json = await misty.read("board", { as: "json" }); // each shared value as JSON
+await misty.change("board", (doc) => doc.getText("title").insert(0, "Q4 "));
+```
+
+`change` hands the edit a copy of the room's current content and sends only what the edit changed, so it merges
+with everyone else's edits. Connected straight to a server they are one HTTP request each; where nothing can take a
+one-off request, the SDK joins the room for a moment instead.
+
 ## Staying in step
 
 The room and Misty compare what each has (Yjs state vectors) when it opens and whenever Misty's own connection to
@@ -83,7 +125,7 @@ they leave.
 
 ## A file as a live document
 
-`room.forFile(fileId)` opens a Space file as a live document, after VS Code's custom editors: Misty opens the file,
+`room(key, { file })`, or `room.forFile(fileId)` for short, opens a Space file as a live document, after VS Code's custom editors: Misty opens the file,
 keeps everyone's copies in step and saves it, and the app only turns the document into bytes and back.
 
 ```ts
@@ -103,11 +145,12 @@ room.editable; // whether this person can edit it
 room.onWriter((writer) => {});
 ```
 
-- **Plain text** (Markdown, code, CSV and the like) is `format: "text"`: the document is `room.text`, a `Y.Text`,
-  and the server saves it into the file itself. Bind an editor to it; no `load` or `serialize` is needed.
-- **Anything else** is `format: "app"`: the document is the app's own, in a room of its own for this app and file,
-  and the app must give both `load` and `serialize`. Without them the room stops as soon as Misty says the file's
-  format, with code `unsupported`, rather than open a file it could never save.
+- **Text** is `format: "text"`: the document is `room.text`, a `Y.Text` (named by the `text` option, `"text"` by
+  default), and the server saves it into the file itself. Bind an editor to it; no `load` or `serialize` is needed.
+- **Anything else** is `format: "app"`: the document is the app's own, and the app must give both `load` and
+  `serialize`. An app that gives both asks for this format (`text: null`) when it opens the room first. Without
+  them the room stops as soon as it learns the file's format, with code `unsupported`, rather than open a file it
+  could never save.
 - One open copy holds the writer's lease, held on the server by its connection and passed on to another open copy
   when it closes, with no timer and no election among apps. Misty calls `load` on that copy when the room is new,
   and `serialize` when the room has changed, and saves what it returns. Nothing unsaved is lost in between: it
@@ -125,6 +168,10 @@ room.onWriter((writer) => {});
 - A `problem` with code `reloaded` ends the room: the file changed somewhere else while nothing here was unsaved,
   so the room was opened afresh from it. Open the file again.
 - The file is marked in use by this person while the room is open.
+
+Inside Misty, Misty runs the file's side itself (who writes, saving, versions, conflicted copies, renames, changes
+made elsewhere); connected straight to a server, the SDK runs that same code, reading and saving through the
+Space's drive. Either way the app sees the same `FileRoom`.
 
 `forFile` needs a Misty that has it: check `misty.supports("room.sync")` first. On a Misty that doesn't say
 whether the file is loaded, `ready` waits only for the room to be in step.

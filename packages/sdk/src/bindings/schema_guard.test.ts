@@ -56,6 +56,7 @@ function fakeRoom(): Room {
     onError: () => () => {},
     onConnection: () => () => {},
     identity: (clientId) => (clientId === doc.clientID ? { user_id: "ana", name: "Ana", tone: "blue" } : null),
+    history: {} as Room["history"],
     destroy: () => {},
   };
 }

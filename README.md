@@ -29,8 +29,9 @@ has no powers an app lacks. For now they speak the protocol's first version, wit
 
 ## Live rooms
 
-`room(id)` joins one of the app's shared Yjs documents in the Space, with everyone's awareness (cursors,
-selections). Everyone who opens the same room id edits the same document; there is no session to start.
+`room(key, options)` joins one of the app's shared Yjs documents in the Space, with everyone's awareness (cursors,
+selections). Everyone who opens the same key edits the same document; there is no session to start. `room(key)` is
+the same call with no options.
 
 ```ts
 const room = misty.room("deck-1");
@@ -52,9 +53,21 @@ field is whatever the other copy of the app wrote.
 A room says whether Misty's link to the server is up (`room.connected`, `onConnection`), hears problems such as a
 room that is too large (`onError`), and opens itself again after a passing failure.
 
-`room.forFile(fileId)` opens a Space file as a live document: plain text is saved by the server, and anything else
+Options are generic and name no app: `gc`, `history` (versions the room keeps, through `room.history.list()`,
+`.read(version)` and `.restore(version)`), and `file`, which binds the room to a Space file.
+`misty.read(key)` and `misty.change(key, edit)` reach a room once without joining it.
+
+`room.forFile(fileId)`, short for `room(fileId, { file: fileId })`, opens a Space file as a live document: plain text is saved by the server, and anything else
 is saved by the one open copy that holds the writer's lease, through the app's own `load` and `serialize`.
 `room.ready` waits until the file's content is in the room.
+
+## Outside Misty
+
+`connect({ server, space })` connects straight to a Space's server from a script, a CLI, a test or a bot, with the
+same `room()`, `read()` and `change()`. A person's own code signs in with a code they approve in Misty, kept in the
+OS keychain; code that runs on its own uses a Space integration's token (`misty_int_…`). The protocol travels over
+a WebSocket, an event stream, single requests, Misty's channel or memory, whichever transport fits. See
+[`docs/outside-misty.md`](docs/outside-misty.md).
 
 ## Bindings and a script with no build step
 
@@ -76,6 +89,6 @@ this Misty answers a call or topic. The protocol is the contract under this pack
 
 ## Docs
 
-The guides are in [`docs/`](docs): getting started, files and chat, live rooms, editor bindings, agent tools,
-voice calls, live values and the wire protocol. They are plain Markdown with a title and order in their front matter, so the Misty
+The guides are in [`docs/`](docs): getting started, files and chat, live rooms, editor bindings, agent tools, agents in a room,
+voice calls, live values, the wire protocol and connecting from outside Misty. They are plain Markdown with a title and order in their front matter, so the Misty
 docs site pulls them in as they are.

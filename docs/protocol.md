@@ -1,6 +1,6 @@
 ---
 title: Wire protocol
-order: 8
+order: 9
 ---
 
 # Wire protocol
@@ -226,6 +226,12 @@ anyone else, so it can't be faked. The app's own fields (a cursor, a selection, 
 copy of the app wrote: draw a person's name only from `misty`, and draw no one for a state without it. An app can
 only send states for its own awareness clients.
 
+An app sends a state for one of its agents (see [Agents in a room](agents-in-rooms.md)) from an awareness
+client of its own, with the field `agent` set to the agent's id. Misty stamps that state's `misty` as
+`{ user_id, name, tone, agent: { id, name } }` only when the agent is at work in that window (it called the app's
+tools or drives it); a state that claims any other agent is sent as gone, and when an agent stops being one the
+window may act for, Misty sends its states as gone.
+
 ### Files as live documents
 
 `{ file }` opens the live document of a Space file, after VS Code's custom editors: Misty owns opening, saving
@@ -259,7 +265,55 @@ and keeping the document, and the app only turns it into bytes.
   only once the room is in step and loaded; a failed `room.serialized` call doesn't end the room.
 - The file is marked in use by this person while the room is open.
 
+### Room options (added)
+
+Where Misty lists `room.options` among its topics, a `room` subscription may carry `options`, and Misty passes
+them to the server when it opens the room:
+
+- `history: true` keeps versions of the room (below).
+- For `{ file }`: `text`, the name of the `Y.Text` the server saves (`"text"` by default), or `null` when the app
+  saves the whole document itself through `load` and `serialize` (the `app` format). An app that gives both
+  `load` and `serialize` sends `text: null`. `key`, when the room's key isn't the file's id.
+
+A room's options are fixed by whoever opens it first; leaving one out takes the room's. Without `room.options`,
+Misty opens rooms as the first version did and an app shouldn't ask for these.
+
+Where Misty lists the call `room.option`, `room.option { id, message }` sends an option message to the server for
+that room, and Misty passes the server's option messages back as `{ type: "option", message }` events. An app may
+send any option but `file`, which is Misty's own. The history option's messages:
+
+| The app sends | The server answers |
+| --- | --- |
+| `{ option: "history", type: "list", request }` | `{ option: "history", type: "list", request, versions: [{ id, at, size, by }] }` |
+| `{ option: "history", type: "read", request, version }` | `{ option: "history", type: "read", request, version, update }`, the version as a base64 Yjs update |
+| `{ option: "history", type: "restore", request, version }` | `{ option: "history", type: "restored", request, version }`, then the restore arrives as ordinary sync |
+
+A failure answers `{ option: "history", type: "error", request, code }`. Restoring needs edit access.
+
+### Raw room frames (added)
+
+Where Misty lists the topic `room.frames` and the call `room.frame`, an app can speak the server's own room
+protocol (y-websocket frames and JSON option messages) through Misty, which forwards the frames under the person's
+own sign-in. Misty prefixes the key with the app's id, so apps never share a room by accident; the app never sees a
+token. The SDK uses this for a room whose key the first version can't name.
+
+- `room.frames { key, options? }` is one connection to the room. Its events are
+  `{ type: "opened", conn, opened }` (the server's `opened` message), `{ type: "binary", frame }`,
+  `{ type: "text", message }` and `{ type: "closed", code, reason }`, with the server's close codes.
+- `room.frame { conn, frame }` sends one binary frame on it, `room.frame { conn, message }` one text frame.
+  Ending the subscription closes the connection.
+
+### Reading and changing without joining (added)
+
+Where Misty lists `room.read` and `room.change`:
+
+- `room.read { key, as? }` answers `{ update }` (the whole room as one Yjs update) or, with `as: "json"`,
+  `{ json }`, each shared value as JSON. It answers `null` for a room that was never opened.
+- `room.change { key, update, options? }` applies a Yjs update to the room, making it with `options` if it doesn't
+  exist yet.
+
 ## The MCP stream
 
 `{ t: "mcp", message }` carries the app's MCP server for agents, one JSON-RPC message per frame, in both
-directions. See [Agent tools](mcp-tools.md).
+directions. See [Agent tools](mcp-tools.md). A `tools/call` request's `params._meta["misty/agent"]` is
+`{ id, name }`, the agent making the call, written by Misty from the agent's run.

@@ -24,4 +24,7 @@ await server.connect(misty.mcpTransport());
 callbacks. The SDK never reads the messages; it only carries them. A tool call from an agent reaches the app
 through the same gate as any other action, so it can only do what the app was approved to do.
 
+Each call names the agent making it in `_meta["misty/agent"]`; `agentOfCall(extra)` reads it. To make the
+agent's edits its own, live and with their own undo, see [Agents in a room](agents-in-rooms.md).
+
 An app that needs a native server uses `mcp: "binary"` instead.

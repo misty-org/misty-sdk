@@ -5,11 +5,26 @@ import { createFrameTransport } from "./mcp.js";
 import type { FrameTransport } from "./mcp.js";
 import { live } from "./live.js";
 import type { Live } from "./live.js";
-import { FIRST_OFFERS, INIT_MESSAGE, PROTOCOL_VERSIONS } from "./protocol.js";
+import { FIRST_OFFERS, INIT_MESSAGE, PROTOCOL_VERSIONS, ROOM_OPTIONS_FEATURE } from "./protocol.js";
 import type { HelloResult, InitMessage, Offers, Topics, WatchOptions } from "./protocol.js";
 import { openFileRoom, openRoom } from "./room.js";
-import type { FileRoom, FileRoomOptions, Room, RoomHost, RoomOptions } from "./room.js";
+import type { FileRoomOptions, RoomHost, RoomOptions } from "./room.js";
+import { isRoomId } from "./room_bridge.js";
+import { openRoomClient } from "./room_client.js";
+import { directRooms, roomOver, roomRequests, wireOptionsOf } from "./rooms.js";
+import type { RoomOpener, Rooms } from "./rooms.js";
+import { serverFileStore } from "./file_store_server.js";
+import type { FileStore } from "./file_store.js";
+import { apiBase, collabAddress, signIn } from "./sign_in.js";
+import type { DeviceCode } from "./sign_in.js";
 import { applyTheme } from "./theme.js";
+import type { Transport } from "./transport.js";
+import { hostRequests, hostTransport } from "./transport_host.js";
+import { requestTransport } from "./transport_request.js";
+import { streamTransport } from "./transport_stream.js";
+import { socketConstructor, webSocketTransport } from "./transport_websocket.js";
+import type { WebSocketConstructor } from "./transport_websocket.js";
+import { SDK_VERSION } from "./version.js";
 import type {
   AgentControl,
   AppContext,
@@ -19,6 +34,7 @@ import type {
   FileChange,
   FilePage,
   FileRef,
+  Identity,
   ListFilesOptions,
   Me,
   Member,
@@ -34,14 +50,11 @@ import type {
   VoiceChannel,
 } from "./types.js";
 
-export const SDK_VERSION = "0.2.0";
+export { SDK_VERSION };
 
 type LiveTopic = "members.presence" | "calls.channels" | "calls.current" | "agents.control";
 
-export interface RoomOpener {
-  (id: string, options?: RoomOptions): Room;
-  forFile(fileId: string, options?: FileRoomOptions): FileRoom;
-}
+export type { RoomOpener };
 
 export interface LiveFilesOptions {
   folder?: string;
@@ -56,7 +69,7 @@ export interface MistyLive {
   agent(): Live<AgentControl>;
 }
 
-export interface Misty {
+export interface Misty extends Rooms {
   readonly appId: string;
   readonly permissions: AppContext["permissions"];
   readonly protocol: number;
@@ -90,8 +103,6 @@ export interface Misty {
     upload(options: UploadOptions): Promise<FileRef>;
     download(fileId: string): Promise<{ file: FileRef; data: ArrayBuffer }>;
   };
-
-  room: RoomOpener;
 
   agents: {
     control(listener: (control: AgentControl) => void): Unsubscribe;
@@ -131,9 +142,12 @@ function buildMisty(connection: Connection, context: HelloResult, options: Creat
   const offers: Offers = context.offers ?? FIRST_OFFERS;
   const offered = new Set([...offers.calls, ...offers.topics]);
   const supports = (name: string) => offered.has(name);
+  const me: Identity = { user_id: context.me.user_id, name: context.me.name, tone: context.me.tone ?? null };
   const roomHost: RoomHost = {
     syncs: offers.calls.includes("room.sync"),
-    me: { user_id: context.me.user_id, name: context.me.name, tone: context.me.tone ?? null },
+    me,
+    options: offers.topics.includes(ROOM_OPTIONS_FEATURE),
+    option: offers.calls.includes("room.option"),
   };
   let theme = context.theme;
   let route = context.route;
@@ -249,13 +263,42 @@ function buildMisty(connection: Connection, context: HelloResult, options: Creat
       };
     });
 
-  const room = ((id: string, roomOptions?: RoomOptions) =>
-    openRoom(connection, id, roomOptions ?? {}, roomHost)) as RoomOpener;
-  room.forFile = (fileId, fileOptions) => {
+  const frames = supports("room.frames") && offers.calls.includes("room.frame");
+  const framesTransport = frames ? hostTransport(connection, false) : null;
+  const openFile = (key: string, fileId: string, fileOptions: FileRoomOptions = {}) => {
     if (!supports("room.sync"))
       throw new MistyError("unsupported", "This version of Misty can't open a file as a live document.");
-    return openFileRoom(connection, fileId, fileOptions ?? {}, roomHost);
+    return openFileRoom(connection, fileId, { ...fileOptions, key }, roomHost);
   };
+  const openPlain = (key: string, roomOptions: RoomOptions = {}) => {
+    const protocolOne = isRoomId(key) && (roomOptions.history === undefined || roomHost.options === true);
+    if (protocolOne || !framesTransport) return openRoom(connection, key, roomOptions, roomHost);
+    return roomOver(
+      openRoomClient({
+        transport: framesTransport,
+        space: context.space.id,
+        key,
+        options: wireOptionsOf({ ...roomOptions, file: undefined }),
+        identity: me,
+      }),
+      () => undefined,
+    );
+  };
+  const room = ((key: string, roomOptions?: RoomOptions & FileRoomOptions) => {
+    if (roomOptions?.file !== undefined) {
+      const { file, ...rest } = roomOptions;
+      return openFile(key, file, rest);
+    }
+    return openPlain(key, roomOptions);
+  }) as RoomOpener;
+  room.forFile = (fileId, fileOptions) => openFile(fileId, fileId, fileOptions);
+  const requests = roomRequests({
+    space: context.space.id,
+    ...(offers.calls.includes("room.read") && offers.calls.includes("room.change")
+      ? { request: hostRequests(connection) }
+      : {}),
+    join: (key, roomOptions) => openPlain(key, roomOptions),
+  });
 
   return {
     appId: context.app_id,
@@ -291,6 +334,8 @@ function buildMisty(connection: Connection, context: HelloResult, options: Creat
       download: (fileId) => connection.call("files.download", { file_id: fileId }),
     },
     room,
+    read: requests.read,
+    change: requests.change,
     agents: {
       control: (listener) => connection.subscribe("agents.control", undefined, listener),
     },
@@ -382,7 +427,131 @@ function followRestarts(connection: Connection, first: MessagePort, protocol: nu
   connection.onClose(() => window.removeEventListener("message", onMessage));
 }
 
-export function connect(options: ConnectOptions = {}): Promise<Misty> {
+export interface TransportConnectOptions {
+  transport: Transport;
+  space: string;
+  identity?: Identity;
+  files?: FileStore;
+  notice?(message: string): void;
+}
+
+export interface ServerConnectOptions {
+  server: string;
+  space?: string;
+  token?: string;
+  collab?: string;
+  via?: "websocket" | "stream";
+  name?: string;
+  onCode?: (code: DeviceCode) => void;
+  keychain?: boolean;
+  files?: FileStore;
+  notice?(message: string): void;
+  fetch?: typeof fetch;
+  WebSocket?: WebSocketConstructor;
+}
+
+export type DirectConnectOptions = TransportConnectOptions | ServerConnectOptions;
+
+export interface MistyClient extends Rooms {
+  readonly spaceId: string;
+  readonly identity: Identity;
+  readonly server: string | null;
+  signOut(): Promise<void>;
+  onClose(listener: () => void): Unsubscribe;
+  close(): void;
+}
+
+const isDirect = (options: ConnectOptions | DirectConnectOptions): options is DirectConnectOptions =>
+  ("transport" in options && options.transport !== undefined) || ("server" in options && options.server !== undefined);
+
+export function connect(options?: ConnectOptions): Promise<Misty>;
+export function connect(options: DirectConnectOptions): Promise<MistyClient>;
+export function connect(options: ConnectOptions | DirectConnectOptions = {}): Promise<Misty | MistyClient> {
+  if (isDirect(options)) return connectDirect(options);
+  return connectHost(options);
+}
+
+const nobody: Identity = { user_id: "", name: "", tone: null };
+
+async function connectDirect(options: DirectConnectOptions): Promise<MistyClient> {
+  if ("transport" in options) {
+    const rooms = directRooms({
+      transport: options.transport,
+      space: options.space,
+      identity: options.identity ?? nobody,
+      ...(options.files ? { files: options.files } : {}),
+      ...(options.notice ? { notice: options.notice } : {}),
+    });
+    return {
+      spaceId: options.space,
+      identity: options.identity ?? nobody,
+      server: null,
+      room: rooms.room,
+      read: rooms.read,
+      change: rooms.change,
+      signOut: async () => rooms.close(),
+      onClose: rooms.onClose,
+      close: rooms.close,
+    };
+  }
+  const api = apiBase(options.server);
+  const signedIn = await signIn({
+    server: api,
+    ...(options.token === undefined ? {} : { token: options.token }),
+    ...(options.name === undefined ? {} : { name: options.name }),
+    ...(options.onCode === undefined ? {} : { onCode: options.onCode }),
+    ...(options.keychain === undefined ? {} : { keychain: options.keychain }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
+  const space = options.space ?? signedIn.space;
+  if (!space) throw new MistyError("invalid", "Name the Space to connect to: connect({ server, space }).");
+  const collab = options.collab ?? (await collabAddress(api, options.fetch));
+  const token = signedIn.token;
+  const viaSocket = options.via !== "stream" && socketConstructor(options.WebSocket) !== undefined;
+  const transport: Transport = {
+    ...(viaSocket
+      ? webSocketTransport({ url: collab, token, ...(options.WebSocket ? { WebSocket: options.WebSocket } : {}) })
+      : streamTransport({ url: collab, token, ...(options.fetch ? { fetch: options.fetch } : {}) })),
+    request: requestTransport({ url: collab, token, ...(options.fetch ? { fetch: options.fetch } : {}) }),
+  };
+  const rooms = directRooms({
+    transport,
+    space,
+    identity: signedIn.identity,
+    files:
+      options.files ??
+      (() =>
+        serverFileStore({
+          api,
+          space,
+          token,
+          ...(options.name === undefined ? {} : { name: options.name }),
+          ...(options.fetch ? { fetch: options.fetch } : {}),
+          ...(options.WebSocket ? { WebSocket: options.WebSocket } : {}),
+        })),
+    ...(options.notice ? { notice: options.notice } : {}),
+  });
+  return {
+    spaceId: space,
+    identity: signedIn.identity,
+    server: api,
+    room: rooms.room,
+    read: rooms.read,
+    change: rooms.change,
+    async signOut() {
+      rooms.close();
+      await signedIn.signOut();
+    },
+    onClose: rooms.onClose,
+    close: rooms.close,
+  };
+}
+
+function connectHost(options: ConnectOptions = {}): Promise<Misty> {
+  if (typeof window === "undefined")
+    return Promise.reject(
+      new MistyError("unsupported", "This isn't running inside Misty. Pass { server, space } to connect to a server."),
+    );
   const timeoutMs = options.timeoutMs ?? 10_000;
   return new Promise<Misty>((resolve, reject) => {
     let settled = false;

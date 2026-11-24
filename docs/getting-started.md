@@ -42,12 +42,16 @@ with `internal` when Misty doesn't answer in time: a minute for most, longer for
 | `members` | The member list, presence and mention suggestions |
 | `chat` | Posting into the Space's chat, opening a chat, notifying someone |
 | `files` | Picking, opening, saving and watching Space files, with who has each open |
-| `room(id)`, `room.forFile(fileId)` | A live shared Yjs document, of the app's own or of a Space file |
+| `room(key, options)`, `room.forFile(fileId)` | A live shared Yjs document, of the app's own or of a Space file |
+| `read(key)`, `change(key, edit)` | A room's content, or one change to it, without joining |
 | `calls` | The Space's voice channels and this window's call |
 | `agents.control()` | When an agent drives the app in this window |
 | `live` | Each of the above that changes, as a value with `get()` and `subscribe()` |
 | `mcpTransport()` | The app's MCP stream for agents |
 | `supports(name)`, `protocol` | What this Misty answers, and the protocol version in use |
+
+Outside Misty, `connect({ server, space })` connects straight to the Space's server instead: see
+[Outside Misty](outside-misty.md).
 
 ## Permissions
 

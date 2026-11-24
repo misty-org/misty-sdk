@@ -23,6 +23,7 @@ function fakeRoom(): Room {
       const state = awareness.getStates().get(clientId) as { misty?: { user_id: string; name: string } } | undefined;
       return state?.misty ? { user_id: state.misty.user_id, name: state.misty.name, tone: "red" } : null;
     },
+    history: {} as Room["history"],
     destroy: () => {},
   };
 }
