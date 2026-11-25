@@ -31,8 +31,7 @@ There are two kinds of sign-in, by who the code acts as.
 **A person's own code** (scripts, a CLI, tests) uses device sign-in. With no token, `connect({ server, space })`
 asks the server for a code, prints a line with a link that opens Misty on it, and waits while the person approves
 it there. Nothing polls: the wait is one held request. The session is kept in the OS keychain (macOS Keychain,
-Windows Credential Manager, the Secret Service on Linux), shared with `misty login` in misty-cli, and never in a
-file in the project. The next run reuses it without asking.
+Windows Credential Manager, the Secret Service on Linux), never in a file in the project. The next run reuses it without asking.
 
 ```ts
 const misty = await connect({
