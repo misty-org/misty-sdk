@@ -66,11 +66,11 @@ The result is the app's context:
 | Field | What it is |
 | --- | --- |
 | `app_id` | The app's id |
-| `space` | `{ id, name, description?, is_mod }` |
+| `space` | `{ id, name, description?, is_mod }`: the Space the person's window shows, and whether they moderate it |
 | `me` | `{ user_id, name, role, avatar_version?, tone? }`: the person using the app; `tone` is their avatar color |
 | `theme` | `{ mode, tokens, fonts: { sans, mono, css? } }` |
 | `route` | `{ path, params }`: the app's own address inside the Space |
-| `permissions` | What the Space's mod approved, of `files`, `chat.post`, `rooms`, `members`, `calls`: never more than the manifest asks, and possibly less |
+| `permissions` | What the person approved when they installed the app on their computer, of `files`, `chat.post`, `rooms`, `members`, `calls`: never more than the manifest asks, and possibly less |
 | `protocol` | The version this connection speaks |
 | `versions` | Every version this Misty speaks |
 | `offers` | `{ calls: string[], topics: string[] }`: everything this Misty answers |
@@ -81,7 +81,7 @@ Besides calls and topics, `offers` may name features of a topic: `room.connectio
 Misty sends the room events of those names.
 
 Treat `permissions` as a hint for what to show, not a promise: a call can still fail with `permission_denied`,
-for instance after the Space's mod changes what the app may do.
+for instance after the person removes the app or a newer version asks for more.
 
 ## Restarts and time limits
 

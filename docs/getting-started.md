@@ -6,8 +6,8 @@ order: 1
 # Getting started
 
 An app runs in a Space inside a sandboxed frame. The SDK is how it reaches the Space: its members, files, chat,
-live rooms and theme. Every call is checked by Misty against the permissions the Space's mod approved when the
-app was installed.
+live rooms and theme. Every call is checked by Misty against the permissions the person approved when they
+installed the app on their computer. The app learns which Space it's in from `hello`.
 
 ```bash
 npm install @misty/sdk yjs y-protocols lib0
@@ -56,10 +56,10 @@ Outside Misty, `connect({ server, space })` connects straight to the Space's ser
 ## Permissions
 
 The manifest, `misty-app.json`, lists what the app asks for: `files`, `chat.post`, `rooms`, `members` and
-`calls`. `misty.permissions` is what Misty says the Space's mod approved, which may be less than the manifest
-asks; don't assume the app got what it asked for. A call outside what was approved rejects with a `MistyError`
-whose `code` is `permission_denied`, and that can still happen to a call `permissions` lists, for instance after
-the mod changes what the app may do.
+`calls`. `misty.permissions` is what Misty says the person approved, which may be less than the manifest asks;
+don't assume the app got what it asked for. A call outside what was approved rejects with a `MistyError` whose
+`code` is `permission_denied`, and that can still happen to a call `permissions` lists, for instance after the
+person removes the app or a newer version asks for more.
 
 ## Older and newer Misty
 

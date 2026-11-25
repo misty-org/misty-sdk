@@ -1,7 +1,8 @@
 # misty-sdk
 
 The SDK for open-source apps that run in a Misty Space, under the MIT license. Misty makes no apps of its own:
-every app is someone else's, added to a Space by pasting its GitHub link. This package is for whoever writes an
+every app is someone else's, listed in Misty's registry and installed on a person's computer, where it opens in
+whichever Space their window shows. This package is for whoever writes an
 app's integration with Misty, its maker or anyone else: the app's own MCP tools for agents (over the frame
 transport), live co-editing through a shared Yjs document (`room()`), Space files, members and presence, and
 posting into the Space's chat. An app with no integration still runs in a Space, wrapped by Misty.
