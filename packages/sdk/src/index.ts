@@ -17,6 +17,8 @@ export { MistyError } from "./errors.js";
 export { live } from "./live.js";
 export type { Live, LiveSource, LiveStatus, LiveValue } from "./live.js";
 export { createFrameTransport } from "./mcp.js";
+export { FILE_FORMAT, fileInput, filesInput, registerTool } from "./page_tools.js";
+export type { PageTool, PageToolAnnotations, PageToolOptions } from "./page_tools.js";
 export type { FrameTransport, McpMessage } from "./mcp.js";
 export {
   FIRST_OFFERS,
